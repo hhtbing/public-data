@@ -8,11 +8,8 @@
 # 版本: v3.0
 # 更新: 2026-02-26
 #
-# 下载方式（GitHub Gist 一键部署）:
-#   curl -fsSL https://gist.githubusercontent.com/hhtbing-wisefido/GIST_ID/raw/ota-ql-docker-deploy.sh -o deploy.sh && chmod +x deploy.sh && sudo ./deploy.sh
-#
-# 或直接从仓库下载:
-#   curl -fsSL https://raw.githubusercontent.com/hhtbing-wisefido/OTA-QL/main/project-code/server/ota-ql-docker-deploy.sh -o deploy.sh && chmod +x deploy.sh && sudo ./deploy.sh
+# 一键部署（推荐）:
+#   wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisefido/public-data/main/OTA-QL-data/ota-ql-docker-deploy.sh" && chmod +x ota-ql-docker-deploy.sh && sudo ./ota-ql-docker-deploy.sh
 #
 # 服务端口:
 #   TCP  1060 — V2 TCP调度/注册（设备直连）
@@ -45,6 +42,8 @@ CONTAINER_NAME="ota-ql"
 DATA_DIR="/opt/ota-ql"
 FIRMWARE_DIR="${DATA_DIR}/firmware"
 APP_DATA_DIR="${DATA_DIR}/data"
+CERTS_DIR="${DATA_DIR}/certs"
+LOGS_DIR="${DATA_DIR}/logs"
 DEPLOY_MODE_FILE="${DATA_DIR}/.deploy_mode"
 BACKUP_BASE_DIR="/backup/ota-ql"
 BACKUP_LIST_FILE="${BACKUP_BASE_DIR}/.backup_list"
@@ -135,7 +134,7 @@ detect_deployment_type() {
 
 create_data_directories() {
     log_info "检查数据目录..."
-    for dir in "${DATA_DIR}" "${FIRMWARE_DIR}" "${APP_DATA_DIR}"; do
+    for dir in "${DATA_DIR}" "${FIRMWARE_DIR}" "${APP_DATA_DIR}" "${CERTS_DIR}" "${LOGS_DIR}"; do
         if [ ! -d "${dir}" ]; then
             log_info "创建目录: ${dir}"
             mkdir -p "${dir}"
@@ -185,6 +184,63 @@ pull_latest_image() {
     fi
 }
 
+# 端口冲突检测
+# 参数: $1 = 绑定地址
+check_port_conflicts() {
+    local BIND_ADDR="${1:-127.0.0.1}"
+    local CONFLICT=false
+    local PORTS=("${TCP_PORT}" "${HTTP_PORT}" "${API_PORT}" "${HTTPS_PORT}" "${MQTT_PORT}")
+    local NAMES=("TCP调度" "HTTP固件" "Web管理" "HTTPS认证" "MQTT")
+
+    log_info "检查端口占用..."
+    for i in "${!PORTS[@]}"; do
+        local PORT="${PORTS[$i]}"
+        local NAME="${NAMES[$i]}"
+        # 使用 ss 或 netstat 检测端口
+        local IN_USE=false
+        if command -v ss &>/dev/null; then
+            if ss -tlnp 2>/dev/null | grep -qE ":${PORT}\b"; then
+                IN_USE=true
+            fi
+        elif command -v netstat &>/dev/null; then
+            if netstat -tlnp 2>/dev/null | grep -qE ":${PORT}\b"; then
+                IN_USE=true
+            fi
+        fi
+
+        if $IN_USE; then
+            CONFLICT=true
+            local OCCUPIER=$(ss -tlnp 2>/dev/null | grep -E ":${PORT}\b" | head -1 | sed -n 's/.*users:(("\([^"]*\)".*/\1/p')
+            [ -z "$OCCUPIER" ] && OCCUPIER="未知进程"
+            echo -e "  ${RED}✗${NC} 端口 ${PORT} (${NAME}) — 已被 ${OCCUPIER} 占用"
+        else
+            echo -e "  ${GREEN}✓${NC} 端口 ${PORT} (${NAME}) — 可用"
+        fi
+    done
+
+    if $CONFLICT; then
+        echo ""
+        log_error "存在端口冲突！容器将无法启动"
+        echo ""
+        echo "解决方案:"
+        echo "  1. 停止占用端口的服务: sudo systemctl stop <服务名>"
+        echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '443|1060|8688|8690|1883'"
+        echo "  3. 如果 443 被 nginx/apache 占用:"
+        echo "     sudo systemctl stop nginx   # 或 apache2"
+        echo "  4. 或修改本脚本中的端口变量后重试"
+        echo ""
+        read -p "是否强制继续部署？(可能失败) [y/N]: " FORCE
+        if [[ ! "$FORCE" =~ ^[Yy]$ ]]; then
+            log_info "部署已取消，请先释放端口后重试"
+            return 1
+        fi
+        log_warning "用户选择强制继续..."
+    else
+        log_success "所有端口可用"
+    fi
+    return 0
+}
+
 # 启动新容器
 # 参数: $1 = 绑定地址 (127.0.0.1 或 0.0.0.0)
 start_new_container() {
@@ -207,6 +263,8 @@ start_new_container() {
         -p ${BIND_ADDR}:${MQTT_PORT}:1883 \
         -v ${FIRMWARE_DIR}:/app/firmware \
         -v ${APP_DATA_DIR}:/app/data \
+        -v ${CERTS_DIR}:/app/certs \
+        -v ${LOGS_DIR}:/app/logs \
         ${ENV_ARGS} \
         --health-cmd="wget -q --spider http://localhost:8690/api/health || exit 1" \
         --health-interval=30s \
@@ -457,6 +515,11 @@ deploy_container() {
     fi
 
     create_data_directories
+
+    if ! check_port_conflicts "$bind_addr"; then
+        return 1
+    fi
+
     backup_current_image
     stop_old_container
 
@@ -590,7 +653,7 @@ check_volumes() {
 
     # 方法1: 检查数据目录
     echo "[1. 数据目录检查]"
-    for dir_name in "firmware" "data"; do
+    for dir_name in "firmware" "data" "certs" "logs"; do
         local dir_path="${DATA_DIR}/${dir_name}"
         if [ -d "${dir_path}" ]; then
             local dir_size=$(du -sh "${dir_path}" 2>/dev/null | cut -f1)
