@@ -184,9 +184,10 @@ pull_latest_image() {
     fi
 }
 
-# 端口冲突检测
+# 端口冲突检测（区分自身服务与外部服务）
 check_port_conflicts() {
-    local CONFLICT=false
+    local SELF_CONFLICT=false
+    local EXT_CONFLICT=false
     local PORTS=("${TCP_PORT}" "${HTTP_PORT}" "${API_PORT}" "${HTTPS_PORT}" "${MQTT_PORT}")
     local NAMES=("TCP调度" "HTTP固件" "Web管理" "HTTPS认证" "MQTT")
 
@@ -207,25 +208,48 @@ check_port_conflicts() {
         fi
 
         if $IN_USE; then
-            CONFLICT=true
             local OCCUPIER=$(ss -tlnp 2>/dev/null | grep -E ":${PORT}\b" | head -1 | sed -n 's/.*users:(("\([^"]*\)".*/\1/p')
             [ -z "$OCCUPIER" ] && OCCUPIER="未知进程"
-            echo -e "  ${RED}✗${NC} 端口 ${PORT} (${NAME}) — 已被 ${OCCUPIER} 占用"
+
+            # 判断是否是 ota-ql 自身容器占用（docker-proxy 映射或容器名匹配）
+            local IS_SELF=false
+            if echo "$OCCUPIER" | grep -qiE "docker-proxy|docker"; then
+                # docker-proxy 占用 = 可能是 ota-ql 自身容器的端口映射
+                local CONTAINER_PORT_CHECK=$(docker port ${CONTAINER_NAME} 2>/dev/null | grep -E ":${PORT}$" || true)
+                if [ -n "$CONTAINER_PORT_CHECK" ]; then
+                    IS_SELF=true
+                fi
+            fi
+
+            if $IS_SELF; then
+                SELF_CONFLICT=true
+                echo -e "  ${YELLOW}⚡${NC} 端口 ${PORT} (${NAME}) — ota-ql 自身容器占用（将自动释放）"
+            else
+                EXT_CONFLICT=true
+                echo -e "  ${RED}✗${NC} 端口 ${PORT} (${NAME}) — 已被 ${OCCUPIER} 占用"
+            fi
         else
             echo -e "  ${GREEN}✓${NC} 端口 ${PORT} (${NAME}) — 可用"
         fi
     done
 
-    if $CONFLICT; then
+    # 自身容器冲突: 仅提示，自动继续（后续 stop_old_container 会释放端口）
+    if $SELF_CONFLICT && ! $EXT_CONFLICT; then
         echo ""
-        log_error "存在端口冲突！容器将无法启动"
+        log_info "检测到 ota-ql 自身容器占用端口，后续步骤会自动停止旧容器并释放端口"
+        log_success "端口检查通过（自身占用可忽略）"
+        return 0
+    fi
+
+    # 外部服务冲突: 需要用户确认
+    if $EXT_CONFLICT; then
+        echo ""
+        log_error "存在端口冲突！其他服务占用了 ota-ql 需要的端口"
         echo ""
         echo "解决方案:"
         echo "  1. 停止占用端口的服务: sudo systemctl stop <服务名>"
         echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '8443|1060|8688|8690|1883'"
-        echo "  3. 如果 8443 被其他服务占用:"
-        echo "     sudo systemctl stop nginx   # 或 apache2"
-        echo "  4. 或修改本脚本中的端口变量后重试"
+        echo "  3. 或修改本脚本中的端口变量后重试"
         echo ""
         read -p "是否强制继续部署？(可能失败) [y/N]: " FORCE
         if [[ ! "$FORCE" =~ ^[Yy]$ ]]; then
@@ -405,7 +429,7 @@ show_initial_password() {
 
     echo ""
     echo "=========================================="
-    log_highlight "🔐 首次部署 — 获取管理员初始密码"
+    log_highlight "🔐 首次部署 — 管理员初始凭据"
     echo "=========================================="
     echo ""
     log_info "等待系统初始化..."
@@ -415,26 +439,29 @@ show_initial_password() {
 
     if [ -n "$INIT_PASSWORD" ] && [ "$INIT_PASSWORD" != "" ]; then
         echo ""
-        echo "┌────────────────────────────────────────┐"
-        echo "│  管理员初始登录凭据                    │"
-        echo "├────────────────────────────────────────┤"
-        log_highlight "│  用户名: admin"
-        log_highlight "│  密码:   ${INIT_PASSWORD}"
-        echo "├────────────────────────────────────────┤"
-        echo -e "│  ${YELLOW}首次登录后请立即修改密码！${NC}         │"
-        echo "└────────────────────────────────────────┘"
+        echo "┌────────────────────────────────────────────┐"
+        echo "│  🔐 管理员初始登录凭据（仅显示一次！）     │"
+        echo "├────────────────────────────────────────────┤"
+        log_highlight "│  👤 用户名: admin"
+        log_highlight "│  🔑 密码:   ${INIT_PASSWORD}"
+        echo "├────────────────────────────────────────────┤"
+        echo -e "│  ${RED}⚠️  请立即记录此密码！此后不再显示${NC}      │"
+        echo -e "│  ${YELLOW}⚠️  首次登录Web管理面板后请立即修改密码${NC} │"
+        echo "├────────────────────────────────────────────┤"
+        echo -e "│  ${GREEN}管理面板: http://localhost:${API_PORT}/${NC}      │"
+        echo "└────────────────────────────────────────────┘"
+        echo ""
+        echo -e "${RED}🔴 安全提示: 如忘记密码，请使用菜单 [4. 重置管理员密码]${NC}"
         echo ""
     else
         log_warning "无法自动获取初始密码"
-        echo "  手动查看: docker logs ${CONTAINER_NAME} 2>&1 | grep '初始密码'"
         echo "  如需重置: 使用菜单选项 [4. 重置管理员密码]"
     fi
 }
 
-# 在摘要中智能显示密码信息
+# 在摘要中智能显示密码信息（不再显示明文密码）
 show_password_info() {
     local PWD_STATUS=$(check_password_changed)
-    local CURRENT_PASSWORD=$(get_current_password)
 
     case $PWD_STATUS in
         "no_file")
@@ -444,11 +471,8 @@ show_password_info() {
             echo -e "  ${GREEN}✓${NC} 管理员密码: 已修改（安全）"
             ;;
         "default")
-            if [ -n "$CURRENT_PASSWORD" ]; then
-                echo -e "  ${YELLOW}!${NC} 管理员密码: ${BOLD}${CURRENT_PASSWORD}${NC} ${RED}(未修改！请尽快更改)${NC}"
-            else
-                echo -e "  ${YELLOW}!${NC} 管理员密码: 查看日志获取 → docker logs ${CONTAINER_NAME} 2>&1 | grep '初始密码'"
-            fi
+            echo -e "  ${YELLOW}!${NC} 管理员密码: ${RED}未修改！请尽快登录Web管理面板修改密码${NC}"
+            echo -e "  ${YELLOW}!${NC} 如忘记初始密码，请使用菜单 [4. 重置管理员密码]"
             ;;
     esac
 }
@@ -650,7 +674,7 @@ show_commands() {
     echo "  重启容器:     docker restart ${CONTAINER_NAME}"
     echo "  停止容器:     docker stop ${CONTAINER_NAME}"
     echo "  查看状态:     docker ps -f name=${CONTAINER_NAME}"
-    echo "  查看密码:     docker logs ${CONTAINER_NAME} 2>&1 | grep '初始密码'"
+    echo "  重置密码:     sudo ./ota-ql-docker-deploy.sh (菜单选项4)"
     echo ""
 }
 
@@ -740,7 +764,7 @@ reset_admin_password() {
     if [ ! -f "${ADMIN_FILE}" ]; then
         log_warning "管理员配置文件不存在"
         echo "  容器可能尚未初始化"
-        echo "  查看初始密码: docker logs ${CONTAINER_NAME} 2>&1 | grep '初始密码'"
+        echo "  如需重置: 使用菜单选项 [4. 重置管理员密码]"
         return 0
     fi
 
@@ -775,20 +799,20 @@ reset_admin_password() {
         log_success "密码重置成功！"
         echo "=========================================="
         echo ""
-        echo "┌────────────────────────────────────────┐"
-        echo "│  新的管理员登录凭据                    │"
-        echo "├────────────────────────────────────────┤"
-        log_highlight "│  用户名: admin"
-        log_highlight "│  密码:   ${NEW_PASSWORD}"
-        echo "├────────────────────────────────────────┤"
-        echo -e "│  ${YELLOW}请立即登录并修改密码！${NC}               │"
-        echo "└────────────────────────────────────────┘"
+        echo "┌────────────────────────────────────────────┐"
+        echo "│  🔐 新的管理员登录凭据（仅显示一次！）     │"
+        echo "├────────────────────────────────────────────┤"
+        log_highlight "│  👤 用户名: admin"
+        log_highlight "│  🔑 密码:   ${NEW_PASSWORD}"
+        echo "├────────────────────────────────────────────┤"
+        echo -e "│  ${RED}⚠️  请立即记录此密码！此后不再显示${NC}      │"
+        echo -e "│  ${YELLOW}⚠️  登录后请立即修改密码！${NC}              │"
+        echo "└────────────────────────────────────────────┘"
         echo ""
         log_highlight "管理面板: http://localhost:${API_PORT}/"
         echo ""
     else
         log_error "无法获取新密码"
-        echo "  手动查看: docker logs ${CONTAINER_NAME} 2>&1 | grep '初始密码'"
         echo "  恢复原配置: cp ${BACKUP_FILE} ${ADMIN_FILE} && docker restart ${CONTAINER_NAME}"
     fi
 }
