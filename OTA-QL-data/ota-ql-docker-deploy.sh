@@ -5,8 +5,8 @@
 # 文件名: ota-ql-docker-deploy.sh
 # 用途: 首次部署、滚动更新、备份恢复、密码重置、存储卷检查、日志管理、SSL证书管理
 # 作者: WiseFido Technologies
-# 版本: v5.0
-# 更新: 2026-03-09
+# 版本: v5.1
+# 更新: 2026-03-08
 #
 # 一键部署（推荐）:
 #   wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisefido/public-data/main/OTA-QL-data/ota-ql-docker-deploy.sh" && chmod +x ota-ql-docker-deploy.sh && sudo ./ota-ql-docker-deploy.sh
@@ -748,6 +748,10 @@ search_certs_for_domain() {
     log_info "搜索域名 ${domain} 的SSL证书..."
     echo ""
 
+    # v5.1: 全局去重数组 — 按真实路径(realpath)去重，避免同一文件被不同面板名称重复报告
+    # 根因: 宝塔/aaPanel共用cert/路径; ssl/通常是cert/的软链接
+    local seen_real_paths=()
+
     local found_count=0
     for entry in "${CERT_SEARCH_PATHS[@]}"; do
         local panel_name=$(echo "$entry" | cut -d'|' -f1)
@@ -759,6 +763,23 @@ search_certs_for_domain() {
         local key_path="${key_template//<DOMAIN>/$domain}"
 
         if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+            # v5.1 去重: 解析软链接后获取真实路径，跳过重复
+            local real_cert=$(realpath "$cert_path" 2>/dev/null || readlink -f "$cert_path" 2>/dev/null || echo "$cert_path")
+            local real_key=$(realpath "$key_path" 2>/dev/null || readlink -f "$key_path" 2>/dev/null || echo "$key_path")
+            local dedup_key="${real_cert}|${real_key}"
+
+            local is_dup=false
+            for seen in "${seen_real_paths[@]}"; do
+                if [ "$seen" = "$dedup_key" ]; then
+                    is_dup=true
+                    break
+                fi
+            done
+            if [ "$is_dup" = "true" ]; then
+                continue  # 跳过重复路径（不同面板名称指向同一文件）
+            fi
+            seen_real_paths+=("$dedup_key")
+
             found_count=$((found_count + 1))
             FOUND_CERTS+=("${panel_name}|${cert_path}|${key_path}")
 
@@ -812,10 +833,11 @@ search_certs_for_domain() {
             # 搜索包含域名的证书文件
             local extra_certs=$(find "$search_dir" -name "fullchain.pem" -o -name "fullchain.cer" -o -name "*.crt" 2>/dev/null | grep -i "$domain" 2>/dev/null)
             for extra_cert in $extra_certs; do
-                # 检查是否已在 FOUND_CERTS 中
+                # v5.1: 用realpath去重（替代旧的字符串匹配）
+                local real_extra=$(realpath "$extra_cert" 2>/dev/null || readlink -f "$extra_cert" 2>/dev/null || echo "$extra_cert")
                 local already_found=false
-                for existing in "${FOUND_CERTS[@]}"; do
-                    if echo "$existing" | grep -q "$extra_cert"; then
+                for seen in "${seen_real_paths[@]}"; do
+                    if echo "$seen" | grep -q "^${real_extra}|"; then
                         already_found=true
                         break
                     fi
@@ -832,6 +854,9 @@ search_certs_for_domain() {
                         fi
                     done
                     if [ -n "$extra_key" ]; then
+                        local real_extra_key=$(realpath "$extra_key" 2>/dev/null || readlink -f "$extra_key" 2>/dev/null || echo "$extra_key")
+                        local extra_dedup="${real_extra}|${real_extra_key}"
+                        seen_real_paths+=("$extra_dedup")
                         found_count=$((found_count + 1))
                         FOUND_CERTS+=("发现于${search_dir}|${extra_cert}|${extra_key}")
                         echo -e "  ${GREEN}✓${NC} [${found_count}] 额外发现 (${search_dir})"
@@ -1213,6 +1238,8 @@ search_all_certs() {
 
     local total_found=0
     ALL_SEARCH_RESULTS=()
+    # v5.1: 全局去重 — 按realpath去重，避免同一文件重复列出
+    local seen_real_paths=()
 
     for search_dir in "${search_dirs[@]}"; do
         if [ -d "$search_dir" ]; then
@@ -1233,6 +1260,22 @@ search_all_certs() {
                     done
 
                     if [ -n "$key_file" ]; then
+                        # v5.1 去重: 解析真实路径
+                        local real_cert=$(realpath "$cert_file" 2>/dev/null || readlink -f "$cert_file" 2>/dev/null || echo "$cert_file")
+                        local real_key=$(realpath "$key_file" 2>/dev/null || readlink -f "$key_file" 2>/dev/null || echo "$key_file")
+                        local dedup_key="${real_cert}|${real_key}"
+                        local is_dup=false
+                        for seen in "${seen_real_paths[@]}"; do
+                            if [ "$seen" = "$dedup_key" ]; then
+                                is_dup=true
+                                break
+                            fi
+                        done
+                        if [ "$is_dup" = "true" ]; then
+                            continue
+                        fi
+                        seen_real_paths+=("$dedup_key")
+
                         total_found=$((total_found + 1))
                         ALL_SEARCH_RESULTS+=("${domain_guess}|${cert_file}|${key_file}")
 
@@ -1378,6 +1421,257 @@ show_cert_guide() {
     echo ""
 }
 
+# 跨域名证书部署（单证书覆盖多域名）
+# v5.1: 搜索所有域名的证书，检查SAN覆盖范围，用一个证书同时服务多个域名
+# 典型场景: 生产(ota.wisefido.com)和测试(ota.wisefido.work)共用同一证书（通配符或SAN证书）
+deploy_cert_cross_domain() {
+    echo ""
+    echo "=========================================="
+    echo "  跨域名证书部署 (v5.1)"
+    echo "=========================================="
+    echo ""
+
+    echo -e "${BOLD}功能说明:${NC}"
+    echo "  搜索系统中的证书，检查其SAN（主题备用名称）是否覆盖多个域名"
+    echo "  部署一个证书即可同时服务生产域名和测试域名"
+    echo ""
+    echo -e "${BOLD}适用场景:${NC}"
+    echo "  • 通配符证书 (*.wisefido.com 覆盖所有子域名)"
+    echo "  • SAN证书 (ota.wisefido.com + ota.wisefido.work 写在同一张证书)"
+    echo "  • 单域名证书部署到多域名环境（证书只匹配一个域名）"
+    echo ""
+
+    # 先搜索系统中所有证书
+    echo "[步骤1] 搜索系统中所有可用证书..."
+    echo ""
+
+    local search_dirs=(
+        "/www/server/panel/vhost/cert"
+        "/etc/letsencrypt/live"
+        "/root/.acme.sh"
+        "/opt/1panel"
+        "/etc/nginx/ssl"
+    )
+
+    local total_found=0
+    local cert_list=()
+    local seen_real_paths=()
+
+    for search_dir in "${search_dirs[@]}"; do
+        if [ -d "$search_dir" ]; then
+            local certs=$(find "$search_dir" -name "fullchain.pem" -o -name "fullchain.cer" 2>/dev/null)
+            if [ -n "$certs" ]; then
+                while IFS= read -r cert_file; do
+                    local cert_dir=$(dirname "$cert_file")
+                    local key_file=""
+                    local domain_guess=$(basename "$cert_dir")
+                    for kn in "privkey.pem" "private.key" "${domain_guess}.key"; do
+                        if [ -f "${cert_dir}/${kn}" ]; then
+                            key_file="${cert_dir}/${kn}"
+                            break
+                        fi
+                    done
+
+                    if [ -n "$key_file" ]; then
+                        # 去重
+                        local real_cert=$(realpath "$cert_file" 2>/dev/null || readlink -f "$cert_file" 2>/dev/null || echo "$cert_file")
+                        local real_key=$(realpath "$key_file" 2>/dev/null || readlink -f "$key_file" 2>/dev/null || echo "$key_file")
+                        local dedup_key="${real_cert}|${real_key}"
+                        local is_dup=false
+                        for seen in "${seen_real_paths[@]}"; do
+                            if [ "$seen" = "$dedup_key" ]; then
+                                is_dup=true
+                                break
+                            fi
+                        done
+                        if [ "$is_dup" = "true" ]; then continue; fi
+                        seen_real_paths+=("$dedup_key")
+
+                        total_found=$((total_found + 1))
+
+                        # 获取证书详情
+                        local cn="" sans="" expiry="" san_list=""
+                        if command -v openssl &> /dev/null; then
+                            cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1)
+                            sans=$(openssl x509 -in "$cert_file" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/^\s*//')
+                            san_list=$(echo "$sans" | sed 's/DNS://g; s/,/ /g; s/  */ /g')
+                            expiry=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+                        fi
+
+                        cert_list+=("${cert_file}|${key_file}|${cn}|${san_list}|${expiry}")
+
+                        echo -e "  ${GREEN}✓${NC} [${total_found}] CN=${cn}"
+                        echo -e "      SAN: ${san_list:-无}"
+                        echo -e "      到期: ${expiry}"
+                        echo -e "      路径: ${cert_file}"
+                        echo ""
+                    fi
+                done <<< "$certs"
+            fi
+        fi
+    done
+
+    if [ $total_found -eq 0 ]; then
+        echo -e "  ${RED}✗${NC} 未找到任何证书"
+        echo ""
+        echo "  请先为域名申请SSL证书（参考 [5. SSL证书申请指南]）"
+        echo ""
+        echo -e "  ${BOLD}申请多域名证书示例:${NC}"
+        echo -e "  ${CYAN}sudo certbot certonly --standalone -d ota.wisefido.com -d ota.wisefido.work${NC}"
+        echo ""
+        return 1
+    fi
+
+    # 让用户选择
+    echo ""
+    echo "[步骤2] 选择要部署的证书"
+    echo ""
+    echo "  输入编号 [1-${total_found}] 选择证书"
+    echo "  输入 0 返回"
+    echo ""
+    read -p "请选择: " choice
+
+    if [ "$choice" = "0" ] || [ -z "$choice" ]; then
+        return 0
+    fi
+
+    if ! ([ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le $total_found ] 2>/dev/null); then
+        log_warning "无效选择"
+        return 1
+    fi
+
+    local selected="${cert_list[$((choice-1))]}"
+    local sel_cert=$(echo "$selected" | cut -d'|' -f1)
+    local sel_key=$(echo "$selected" | cut -d'|' -f2)
+    local sel_cn=$(echo "$selected" | cut -d'|' -f3)
+    local sel_sans=$(echo "$selected" | cut -d'|' -f4)
+    local sel_expiry=$(echo "$selected" | cut -d'|' -f5)
+
+    echo ""
+    echo "=========================================="
+    echo "  选中证书详情"
+    echo "=========================================="
+    echo ""
+    echo -e "  CN:   ${sel_cn}"
+    echo -e "  SAN:  ${sel_sans:-无}"
+    echo -e "  到期: ${sel_expiry}"
+    echo -e "  路径: ${sel_cert}"
+    echo ""
+
+    # 分析SAN覆盖情况
+    echo "[步骤3] 域名覆盖分析"
+    echo ""
+
+    # 获取当前回调域名
+    local cb_addr=$(get_callback_addr)
+    local cb_domain=""
+    if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        cb_domain="$cb_addr"
+    fi
+
+    # 检查SAN中包含哪些域名
+    local san_count=0
+    local covered_domains=()
+    if [ -n "$sel_sans" ]; then
+        for san_entry in $sel_sans; do
+            san_entry=$(echo "$san_entry" | tr -d ' ')
+            if [ -n "$san_entry" ]; then
+                san_count=$((san_count + 1))
+                covered_domains+=("$san_entry")
+                local match_icon="  "
+                if [ -n "$cb_domain" ]; then
+                    # 检查是否匹配回调域名（支持通配符匹配）
+                    if [ "$san_entry" = "$cb_domain" ]; then
+                        match_icon="${GREEN}✓${NC}"
+                    elif echo "$san_entry" | grep -q '^\*\.'; then
+                        local wildcard_base="${san_entry#\*.}"
+                        if echo "$cb_domain" | grep -qE "\.${wildcard_base}$"; then
+                            match_icon="${GREEN}✓${NC}"
+                        fi
+                    fi
+                fi
+                echo -e "  ${match_icon} ${san_entry}"
+            fi
+        done
+    fi
+    echo ""
+
+    if [ -n "$cb_domain" ]; then
+        echo -e "  当前回调域名: ${CYAN}${cb_domain}${NC}"
+        # 检查是否被覆盖
+        local is_covered=false
+        for cd in "${covered_domains[@]}"; do
+            if [ "$cd" = "$cb_domain" ]; then
+                is_covered=true
+                break
+            fi
+            if echo "$cd" | grep -q '^\*\.'; then
+                local wc_base="${cd#\*.}"
+                if echo "$cb_domain" | grep -qE "\.${wc_base}$"; then
+                    is_covered=true
+                    break
+                fi
+            fi
+        done
+        if [ "$is_covered" = "true" ]; then
+            echo -e "  覆盖状态: ${GREEN}✓ 回调域名已被证书覆盖${NC}"
+        else
+            echo -e "  覆盖状态: ${YELLOW}⚠ 回调域名未在证书SAN中${NC}"
+            echo -e "  ${YELLOW}  ESP32设备可能因域名不匹配而拒绝连接${NC}"
+        fi
+    else
+        echo -e "  ${YELLOW}未设置回调域名（或为IP），跳过覆盖检查${NC}"
+    fi
+    echo ""
+
+    if [ $san_count -gt 1 ]; then
+        echo -e "  ${GREEN}💡 此证书覆盖 ${san_count} 个域名，一次部署即可服务所有域名${NC}"
+    elif [ $san_count -eq 1 ]; then
+        echo -e "  ${YELLOW}💡 此证书仅覆盖 1 个域名${NC}"
+        echo -e "  ${YELLOW}   如需覆盖多域名，请申请SAN证书或通配符证书${NC}"
+        echo -e "  ${CYAN}   示例: sudo certbot certonly --standalone -d domain1.com -d domain2.com${NC}"
+    fi
+    echo ""
+
+    # 确认部署
+    read -p "是否将此证书部署到 OTA-QL? [Y/n]: " deploy_confirm
+    if [[ "$deploy_confirm" =~ ^[Nn]$ ]]; then
+        log_info "已取消部署"
+        return 0
+    fi
+
+    deploy_cert_to_ota "$sel_cert" "$sel_key" "跨域名部署 (CN=${sel_cn})"
+
+    if [ $? -eq 0 ]; then
+        echo ""
+        echo -e "${YELLOW}提示: 证书已部署，需要重启容器生效${NC}"
+        read -p "是否立即重启容器? [Y/n]: " restart_confirm
+        if [[ ! "$restart_confirm" =~ ^[Nn]$ ]]; then
+            docker restart ${CONTAINER_NAME} > /dev/null 2>&1
+            sleep 3
+            log_success "容器已重启，新证书生效"
+        fi
+
+        echo ""
+        echo "=========================================="
+        echo "  部署完成总结"
+        echo "=========================================="
+        echo ""
+        echo -e "  证书CN:  ${sel_cn}"
+        echo -e "  覆盖域名: ${sel_sans}"
+        echo ""
+        echo -e "  ${GREEN}Go服务器将在以下端口使用此证书:${NC}"
+        echo -e "    • cmux设备网关  :${GW_PORT}   (ESP32直连认证)"
+        echo -e "    • MQTTS Broker  :${MQTTS_PORT}  (ESP32 MQTT TLS)"
+        echo -e "    • HTTPS统一服务 :${HTTPS_PORT} (Web管理面板)"
+        echo ""
+        if [ $san_count -gt 1 ]; then
+            echo -e "  ${GREEN}✓ 单证书覆盖 ${san_count} 个域名，无需为每个域名单独配置${NC}"
+        fi
+        echo ""
+    fi
+}
+
 # 证书管理子菜单
 menu_cert_management() {
     echo ""
@@ -1391,9 +1685,10 @@ menu_cert_management() {
     echo "  3. 全局搜索系统中所有证书"
     echo "  4. 手动指定证书路径"
     echo "  5. SSL证书申请指南"
+    echo "  6. 跨域名证书部署（单证书覆盖多域名）"
     echo "  0. 返回主菜单"
     echo ""
-    read -p "请选择 [0-5]: " cert_choice
+    read -p "请选择 [0-6]: " cert_choice
 
     case $cert_choice in
         1)
@@ -1454,6 +1749,9 @@ menu_cert_management() {
             ;;
         5)
             show_cert_guide
+            ;;
+        6)
+            deploy_cert_cross_domain
             ;;
         0)
             return 0
@@ -2255,7 +2553,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "=========================================="
-        echo "  OTA-QL 管理工具 (v5.0)"
+        echo "  OTA-QL 管理工具 (v5.1)"
         echo "=========================================="
         echo ""
         echo -e "  ${GREEN}1.${NC}  一键部署 ${GREEN}(生产环境-安全)${NC}"
