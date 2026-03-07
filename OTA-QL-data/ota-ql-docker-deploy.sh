@@ -291,6 +291,27 @@ start_new_container() {
         ENV_ARGS="-e OTA_SERVER_ADDR=${SERVER_ADDR}"
     fi
 
+    # v8.3 P2: 自动检测并加载TLS证书（解决ESP32 esp-x509-crt-bundle验证自签名证书失败）
+    # 证书用于: cmux设备网关(10086) + MQTTS(8883) + HTTPS(10088) 的TLS握手
+    # 宝塔Nginx的证书只管浏览器访问，设备直连端口需要Go服务器自己的证书
+    local TLS_ENV_ARGS=""
+    local CERT_FILE="${CERTS_DIR}/fullchain.pem"
+    local KEY_FILE="${CERTS_DIR}/privkey.pem"
+    if [ -f "${CERT_FILE}" ] && [ -f "${KEY_FILE}" ]; then
+        TLS_ENV_ARGS="-e OTA_TLS_CERT_FILE=/app/certs/fullchain.pem -e OTA_TLS_KEY_FILE=/app/certs/privkey.pem"
+        log_success "检测到TLS证书: ${CERT_FILE}"
+        log_info "Go服务器将使用CA签名证书（ESP32设备可通过证书验证）"
+    else
+        log_warning "未检测到TLS证书文件: ${CERT_FILE}"
+        log_warning "Go服务器将使用自签名证书（ESP32设备可能无法通过证书验证）"
+        echo ""
+        echo -e "  ${YELLOW}如需ESP32设备正常连接，请复制宝塔SSL证书:${NC}"
+        echo -e "  ${CYAN}cp /www/server/panel/vhost/cert/<域名>/fullchain.pem ${CERTS_DIR}/${NC}"
+        echo -e "  ${CYAN}cp /www/server/panel/vhost/cert/<域名>/privkey.pem ${CERTS_DIR}/${NC}"
+        echo -e "  ${YELLOW}然后重启容器: sudo ./ota-ql-docker-deploy.sh${NC}"
+        echo ""
+    fi
+
     docker run -d \
         --name ${CONTAINER_NAME} \
         --restart unless-stopped \
@@ -301,9 +322,10 @@ start_new_container() {
         -p ${MQTTS_BIND}:${MQTTS_PORT}:8883 \
         -v ${FIRMWARE_DIR}:/app/firmware \
         -v ${APP_DATA_DIR}:/app/data \
-        -v ${CERTS_DIR}:/app/certs \
+        -v ${CERTS_DIR}:/app/certs:ro \
         -v ${LOGS_DIR}:/app/logs \
         ${ENV_ARGS} \
+        ${TLS_ENV_ARGS} \
         --health-cmd="wget -q --no-check-certificate --spider https://localhost:10088/api/health || exit 1" \
         --health-interval=30s \
         --health-timeout=5s \
