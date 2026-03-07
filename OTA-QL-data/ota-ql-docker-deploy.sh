@@ -5,13 +5,13 @@
 # 文件名: ota-ql-docker-deploy.sh
 # 用途: 首次部署、滚动更新、备份恢复、密码重置、存储卷检查、日志管理
 # 作者: WiseFido Technologies
-# 版本: v3.0
-# 更新: 2026-02-26
+# 版本: v4.6
+# 更新: 2026-03-08
 #
 # 一键部署（推荐）:
 #   wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisefido/public-data/main/OTA-QL-data/ota-ql-docker-deploy.sh" && chmod +x ota-ql-docker-deploy.sh && sudo ./ota-ql-docker-deploy.sh
 #
-# 服务端口（v4.4 五端口架构）:
+# 服务端口（v4.6 五端口架构）:
 #   HTTPS 10088 — Web管理面板 + API + 固件下载（统一HTTPS）
 #   HTTP  10089 — ESP32 OTA明文固件下载
 #   GW    10086 — cmux设备网关（TCP+TLS自动识别）
@@ -45,17 +45,18 @@ APP_DATA_DIR="${DATA_DIR}/data"
 CERTS_DIR="${DATA_DIR}/certs"
 LOGS_DIR="${DATA_DIR}/logs"
 DEPLOY_MODE_FILE="${DATA_DIR}/.deploy_mode"
+CALLBACK_ADDR_FILE="${DATA_DIR}/.callback_addr"
 BACKUP_BASE_DIR="/backup/ota-ql"
 BACKUP_LIST_FILE="${BACKUP_BASE_DIR}/.backup_list"
 
-# 服务端口（v4.4 五端口架构）
+# 服务端口（v4.6 五端口架构）
 HTTPS_PORT="10088"       # Web管理面板 + API + 固件下载（统一HTTPS）
-HTTP_FW_PORT="10089"     # v4.4: ESP32 OTA明文固件下载
+HTTP_FW_PORT="10089"     # v4.6: ESP32 OTA明文固件下载
 GW_PORT="10086"          # cmux设备网关（TCP+TLS自动识别）
 MQTT_PORT="1883"         # MQTT Broker（明文）
 MQTTS_PORT="8883"        # MQTT Broker（TLS加密）
 
-# 环境变量覆盖
+# 环境变量覆盖（OTA_SERVER_ADDR 优先级最高，其次是下面的默认值，留空则自动检测本机IP）
 SERVER_ADDR="${OTA_SERVER_ADDR:-}"
 LOG_LEVEL="${OTA_LOG_LEVEL:-info}"
 
@@ -498,6 +499,174 @@ save_deploy_mode() {
     echo "$1" > "${DEPLOY_MODE_FILE}"
 }
 
+# ============================================================================
+# 设备回调地址管理
+# ============================================================================
+
+# 读取已保存的设备回调地址
+get_callback_addr() {
+    if [ -f "${CALLBACK_ADDR_FILE}" ]; then
+        cat "${CALLBACK_ADDR_FILE}" | tr -d '\n\r'
+    else
+        echo ""
+    fi
+}
+
+# 保存设备回调地址
+save_callback_addr() {
+    echo "$1" > "${CALLBACK_ADDR_FILE}"
+}
+
+# 交互式输入设备回调地址（部署时和菜单中复用）
+prompt_callback_addr() {
+    local CURRENT_ADDR=$(get_callback_addr)
+
+    echo ""
+    echo "========================================="
+    echo "  设备回调地址设置/修改"
+    echo "========================================="
+    echo ""
+    echo "什么是设备回调地址？"
+    echo "  设备通过网关(:${GW_PORT})连接服务器并认证后，"
+    echo "  服务器会返回此地址告诉设备："
+    echo "    1. MQTT Broker 连接到哪里 (此地址:${MQTTS_PORT})"
+    echo "    2. OTA 固件从哪里下载 (http://此地址:${HTTP_FW_PORT}/firmware)"
+    echo ""
+    echo "  简单理解：设备认证后\"回拨\"到这个地址获取服务"
+    echo ""
+    echo "地址格式：域名(推荐) 或 IP 均可"
+    echo "  域名示例: ota.wisefido.com"
+    echo "  IP示例:   166.1.190.154"
+    echo ""
+
+    if [ -n "${CURRENT_ADDR}" ]; then
+        log_info "当前设备回调地址: ${CURRENT_ADDR}"
+        read -p "输入新地址 (回车保留当前值): " NEW_ADDR
+        if [ -z "${NEW_ADDR}" ]; then
+            NEW_ADDR="${CURRENT_ADDR}"
+            log_info "保留当前地址: ${NEW_ADDR}"
+        fi
+    else
+        log_warning "尚未配置设备回调地址"
+        read -p "请输入设备回调地址 (域名或IP): " NEW_ADDR
+        if [ -z "${NEW_ADDR}" ]; then
+            log_warning "未输入地址，将使用服务器自动检测IP"
+            return 0
+        fi
+    fi
+
+    save_callback_addr "${NEW_ADDR}"
+    SERVER_ADDR="${NEW_ADDR}"
+    log_success "设备回调地址已设置: ${NEW_ADDR}"
+    return 0
+}
+
+# 查看设备回调地址详情
+show_callback_addr() {
+    local CB_ADDR=$(get_callback_addr)
+    echo ""
+    echo "========================================="
+    echo "  设备回调地址查看"
+    echo "========================================="
+    echo ""
+
+    if [ -n "${CB_ADDR}" ]; then
+        echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
+        echo ""
+        echo "  派生服务地址:"
+        echo "  ────────────────────────────────────"
+        echo "  MQTT Broker:  ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
+        echo "  MQTT明文:     ${CB_ADDR}:${MQTT_PORT} (MQTT)"
+        echo "  固件下载:     http://${CB_ADDR}:${HTTP_FW_PORT}/firmware"
+        echo ""
+        echo "  存储位置: ${CALLBACK_ADDR_FILE}"
+        echo "  环境变量: OTA_SERVER_ADDR=${CB_ADDR}"
+    else
+        log_warning "尚未配置设备回调地址"
+        echo ""
+        echo "  服务器将使用自动检测的公网IP作为回调地址"
+        local AUTO_IP=$(get_public_ip)
+        if [ -n "${AUTO_IP}" ]; then
+            echo -e "  自动检测IP: ${YELLOW}${AUTO_IP}${NC}"
+        else
+            echo -e "  ${RED}!${NC} 无法自动检测公网IP"
+        fi
+        echo ""
+        echo "  建议通过菜单 10 → 1 设置域名或固定IP"
+    fi
+    echo ""
+}
+
+# 设置设备回调地址（含重启Docker选项）
+set_callback_addr_with_restart() {
+    prompt_callback_addr
+
+    local NEW_ADDR=$(get_callback_addr)
+    if [ -z "${NEW_ADDR}" ]; then
+        return 0
+    fi
+
+    # 检查容器是否在运行，提示重启
+    if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
+        echo ""
+        log_warning "设备回调地址是容器启动时的环境变量，修改后需要重启容器才能生效"
+        read -p "是否立即重启容器？[Y/n]: " RESTART
+        if [[ ! "$RESTART" =~ ^[Nn]$ ]]; then
+            log_info "正在重启容器..."
+            docker stop ${CONTAINER_NAME} > /dev/null 2>&1
+            docker rm ${CONTAINER_NAME} > /dev/null 2>&1
+
+            # 读取当前部署模式重新启动
+            local CURRENT_MODE=$(get_deploy_mode)
+            if [ "${CURRENT_MODE}" = "unknown" ]; then
+                CURRENT_MODE="production"
+            fi
+            SERVER_ADDR="${NEW_ADDR}"
+            start_new_container "${CURRENT_MODE}"
+            sleep 3
+
+            if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
+                log_success "容器已重启，新的设备回调地址已生效: ${NEW_ADDR}"
+            else
+                log_error "容器重启失败，请检查日志: docker logs --tail 50 ${CONTAINER_NAME}"
+            fi
+        else
+            log_warning "容器未重启，新地址将在下次部署时生效"
+        fi
+    else
+        log_info "容器未运行，新地址将在下次部署时生效"
+    fi
+}
+
+# 菜单: 设备回调地址设置与查看（含子菜单）
+menu_set_callback_addr() {
+    echo ""
+    echo "========================================="
+    echo "  设备回调地址设置与查看"
+    echo "========================================="
+    echo ""
+    echo "  1. 设置/修改设备回调地址"
+    echo "  2. 查看当前设备回调地址"
+    echo "  0. 返回主菜单"
+    echo ""
+    read -p "请选择 [0-2]: " sub_choice
+
+    case $sub_choice in
+        1)
+            set_callback_addr_with_restart
+            ;;
+        2)
+            show_callback_addr
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            log_warning "无效选择"
+            ;;
+    esac
+}
+
 get_public_ip() {
     local PUBLIC_IP=""
     PUBLIC_IP=$(curl -4 -s --connect-timeout 5 ifconfig.me 2>/dev/null || \
@@ -550,6 +719,14 @@ deploy_container() {
     fi
 
     create_data_directories
+
+    # 交互式设置设备回调地址
+    prompt_callback_addr
+    # 同步回调地址到 SERVER_ADDR（供 start_new_container 使用）
+    local SAVED_ADDR=$(get_callback_addr)
+    if [ -n "${SAVED_ADDR}" ]; then
+        SERVER_ADDR="${SAVED_ADDR}"
+    fi
 
     if ! check_port_conflicts; then
         return 1
@@ -606,6 +783,17 @@ show_production_deploy_success() {
     echo "  MQTTS:      ${MQTTS_PORT}  — 0.0.0.0 (设备TLS直连)"
     echo ""
 
+    local CB_ADDR=$(get_callback_addr)
+    echo "[设备回调地址]"
+    if [ -n "$CB_ADDR" ]; then
+        echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
+        echo "  MQTT地址:    ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
+        echo "  固件下载:    http://${CB_ADDR}:${HTTP_FW_PORT}/firmware"
+    else
+        echo -e "  ${YELLOW}!${NC} 未配置，使用服务器自动检测IP"
+    fi
+    echo ""
+
     echo "[访问地址]"
     echo -e "  ${GREEN}✓${NC} 管理面板:  https://localhost:${HTTPS_PORT}/"
     echo -e "  ${GREEN}✓${NC} 健康检查:  https://localhost:${HTTPS_PORT}/api/health"
@@ -645,6 +833,17 @@ show_test_deploy_success() {
     echo -e "  cmux网关:   ${GW_PORT}  — ${RED}公网可访问${NC}"
     echo -e "  MQTT:       ${MQTT_PORT}  — ${RED}公网可访问${NC}"
     echo -e "  MQTTS:      ${MQTTS_PORT}  — ${RED}公网可访问${NC}"
+    echo ""
+
+    local CB_ADDR=$(get_callback_addr)
+    echo "[设备回调地址]"
+    if [ -n "$CB_ADDR" ]; then
+        echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
+        echo "  MQTT地址:    ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
+        echo "  固件下载:    http://${CB_ADDR}:${HTTP_FW_PORT}/firmware"
+    else
+        echo -e "  ${YELLOW}!${NC} 未配置，使用服务器自动检测IP"
+    fi
     echo ""
 
     echo "[访问地址]"
@@ -1208,6 +1407,17 @@ show_deployment_info() {
     docker inspect --format='{{range .Mounts}}  {{.Source}} → {{.Destination}} ({{.Type}}){{println}}{{end}}' ${CONTAINER_NAME} 2>/dev/null || log_warning "无法获取存储卷"
     echo ""
 
+    local CB_ADDR=$(get_callback_addr)
+    echo "[设备回调地址]"
+    if [ -n "$CB_ADDR" ]; then
+        echo -e "  ${GREEN}✓${NC} 回调地址:   ${CB_ADDR}"
+        echo "  MQTT地址:    ${CB_ADDR}:${MQTTS_PORT} (MQTTS/TLS)"
+        echo "  固件下载:    http://${CB_ADDR}:${HTTP_FW_PORT}/firmware"
+    else
+        echo -e "  ${YELLOW}!${NC} 未配置，使用服务器自动检测IP"
+    fi
+    echo ""
+
     echo "[管理员账户]"
     show_password_info
     echo ""
@@ -1239,7 +1449,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "=========================================="
-        echo "  OTA-QL 管理工具 (v4.4)"
+        echo "  OTA-QL 管理工具 (v4.6)"
         echo "=========================================="
         echo ""
         echo -e "  ${GREEN}1.${NC}  一键部署 ${GREEN}(生产环境-安全)${NC}"
@@ -1251,10 +1461,11 @@ interactive_menu() {
         echo "  7.  一键恢复数据"
         echo "  8.  备份管理"
         echo "  9.  查看日志"
-        echo "  10. 退出"
-        echo -e "  ${RED}11.${NC} 一键部署 ${RED}(仅测试-不安全)${NC}"
+        echo -e "  ${CYAN}10.${NC} 设备回调地址设置与查看"
+        echo "  11. 退出"
+        echo -e "  ${RED}12.${NC} 一键部署 ${RED}(仅测试-不安全)${NC}"
         echo ""
-        read -p "请选择操作 [1-11]: " choice
+        read -p "请选择操作 [1-12]: " choice
 
         case $choice in
             1)
@@ -1302,12 +1513,16 @@ interactive_menu() {
                 read -p "按Enter键返回菜单..." dummy
                 ;;
             10)
+                menu_set_callback_addr
+                read -p "按Enter键返回菜单..." dummy
+                ;;
+            11)
                 echo ""
                 log_info "退出管理工具"
                 echo ""
                 exit 0
                 ;;
-            11)
+            12)
                 echo ""
                 echo -e "${BG_RED}${BOLD}  ⚠️ 警告：测试环境部署  ${NC}"
                 echo ""
@@ -1318,7 +1533,7 @@ interactive_menu() {
                 read -p "按Enter键返回菜单..." dummy
                 ;;
             *)
-                log_warning "无效选择，请输入 1-11"
+                log_warning "无效选择，请输入 1-12"
                 sleep 1
                 ;;
         esac
@@ -1333,8 +1548,8 @@ main() {
     echo ""
     echo "=========================================="
     echo "  OTA-QL Docker 部署管理工具"
-    echo "  版本: v4.4 | 清澜雷达 OTA 升级系统"
-    echo "  服务: HTTPS/GW/MQTT/MQTTS (4端口)"
+    echo "  版本: v4.6 | 清澜雷达 OTA 升级系统"
+    echo "  服务: HTTPS/HTTP_FW/GW/MQTT/MQTTS (5端口)"
     echo "=========================================="
     echo ""
 
