@@ -1,6 +1,6 @@
 # 🐳 OTA-QL 一键 Docker 部署与迁移说明书
 
-> **版本**: v5.1
+> **版本**: v5.2
 > **适用项目**: OTA-QL — ESP32 雷达固件 OTA 升级管理服务
 > **最后更新**: 2026-03-08
 
@@ -74,7 +74,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 ### 2.3 部署流程概览
 
 ```
-执行脚本 → 选择环境(生产/测试) → 设置设备回调地址 → 🆕自动搜索SSL证书 → 自动拉取镜像 → 创建数据卷 → 启动容器 → 健康检查 → 显示密码+回调地址
+执行脚本 → 选择环境(生产/测试) → 设置设备回调地址 → 🆕SSL证书配置(交互式) → 自动拉取镜像 → 创建数据卷 → 启动容器 → 健康检查 → 显示密码+回调地址
 ```
 
 ---
@@ -88,7 +88,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 1. ✅ 检测 Docker 是否安装（未安装则自动安装）
 2. ✅ 创建数据卷目录
 3. ✅ **交互式设置设备回调地址**（域名或IP）
-4. 🆕 **自动搜索宝塔/aaPanel/ACME等面板的SSL证书**（17种路径数据库）
+4. 🆕 **SSL证书配置**（交互式菜单：搜索已有/申请通配符/申请SAN多域名）
 5. ✅ 检查端口冲突
 6. ✅ 拉取最新镜像
 7. ✅ 启动容器（5端口映射 + 回调地址环境变量）
@@ -121,7 +121,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 
 ```
 ==========================================
-  OTA-QL 管理工具 (v5.1)
+  OTA-QL 管理工具 (v5.2)
 ==========================================
 
   1.  一键部署 (生产环境-安全)
@@ -702,7 +702,48 @@ sudo firewall-cmd --reload
 
 ---
 
-> ⚡ **版本历史**:  
-> **v5.1** (2026-03-08) — 修复证书搜索重复误报BUG（realpath去重），新增跨域名证书部署（菜单11→子菜单6）  
-> **v5.0** (2026-03-08) — 新增 SSL 证书管理（章节6 + 菜单11），内置17种面板路径数据库，部署时自动搜索并部署证书  
+### 6.7 多域名证书申请与部署（v5.2 新增）
+
+v5.2 起，部署时的 SSL 证书配置改为交互式菜单，用户可选择三种方式：
+
+| 选项 | 方式 | 说明 |
+|------|------|------|
+| 1 | 搜索已有证书 | 从宝塔/1Panel/Certbot等17种面板路径搜索已申请的证书 |
+| 2 | 申请通配符证书 | `*.domain.com` 覆盖所有子域名（需DNS验证） |
+| 3 | 申请SAN多域名证书 | 指定多个域名写入同一张证书（支持HTTP/DNS验证） |
+| 0 | 跳过 | 使用自签名证书，ESP32可能无法连接 |
+
+**通配符证书申请示例：**
+
+```bash
+# 脚本自动执行，certbot 会要求添加 DNS TXT 记录
+sudo certbot certonly --manual --preferred-challenges dns \
+    -d "*.wisefido.com" -d "wisefido.com"
+
+# 成功后证书 SAN: *.wisefido.com
+# 覆盖: ota.wisefido.com, api.wisefido.com, 任意 xxx.wisefido.com
+```
+
+**SAN 多域名证书申请示例：**
+
+```bash
+# HTTP 验证（需要端口80空闲）
+sudo certbot certonly --standalone \
+    -d ota.wisefido.com -d ota.wisefido.work
+
+# DNS 验证（不占用端口）
+sudo certbot certonly --manual --preferred-challenges dns \
+    -d ota.wisefido.com -d ota.wisefido.work
+
+# 成功后证书 SAN: ota.wisefido.com, ota.wisefido.work
+```
+
+**失败重试机制：** 当选择的方式失败后，脚本会提示尝试其他方式，全部失败后跳过证书配置继续部署（使用自签名证书）。
+
+---
+
+> ⚡ **版本历史**:
+> **v5.2** (2026-03-08) — 部署时SSL证书配置改为交互式菜单（搜索已有/通配符/SAN多域名），新增多域名证书申请指导
+> **v5.1** (2026-03-08) — 修复证书搜索重复误报BUG（realpath去重），新增跨域名证书部署（菜单11→子菜单6）
+> **v5.0** (2026-03-08) — 新增 SSL 证书管理（章节6 + 菜单11），内置17种面板路径数据库，部署时自动搜索并部署证书
 > **v4.6** (2026-03-08) — 菜单10增加子菜单（设置与查看），支持查看回调地址详情及派生服务地址

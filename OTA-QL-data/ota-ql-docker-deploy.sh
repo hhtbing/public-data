@@ -5,7 +5,7 @@
 # 文件名: ota-ql-docker-deploy.sh
 # 用途: 首次部署、滚动更新、备份恢复、密码重置、存储卷检查、日志管理、SSL证书管理
 # 作者: WiseFido Technologies
-# 版本: v5.1
+# 版本: v5.2
 # 更新: 2026-03-08
 #
 # 一键部署（推荐）:
@@ -1776,6 +1776,370 @@ get_public_ip() {
 }
 
 # ============================================================================
+# v5.2: 部署时SSL证书交互式菜单（替代v5.0的auto_detect_and_deploy_certs）
+# ============================================================================
+
+# 使用certbot申请通配符证书（需DNS验证）
+apply_wildcard_cert() {
+    echo ""
+    echo "=========================================="
+    echo "  申请通配符证书 (*.domain.com)"
+    echo "=========================================="
+    echo ""
+
+    local cb_addr=$(get_callback_addr)
+    local base_domain=""
+
+    # 从回调地址推断基础域名（如 ota.wisefido.com → wisefido.com）
+    if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        base_domain=$(echo "$cb_addr" | awk -F. '{if(NF>=2) print $(NF-1)"."$NF}')
+    fi
+
+    echo -e "${BOLD}通配符证书说明:${NC}"
+    echo "  • 一张证书覆盖 *.domain.com 下所有子域名"
+    echo "  • 例如: *.wisefido.com 同时覆盖 ota.wisefido.com 和 api.wisefido.com"
+    echo "  • 必须使用 DNS 验证方式（需要到域名管理面板添加 TXT 记录）"
+    echo ""
+
+    if [ -n "$base_domain" ]; then
+        echo -e "  推测基础域名: ${CYAN}${base_domain}${NC}"
+        echo ""
+    fi
+
+    read -p "请输入基础域名 (如 wisefido.com): " input_domain
+    if [ -z "$input_domain" ] && [ -n "$base_domain" ]; then
+        input_domain="$base_domain"
+        echo "  使用推测域名: $input_domain"
+    fi
+    if [ -z "$input_domain" ]; then
+        log_warning "未输入域名，取消操作"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${BOLD}即将执行:${NC}"
+    echo -e "  ${CYAN}sudo certbot certonly --manual --preferred-challenges dns -d \"*.${input_domain}\" -d \"${input_domain}\"${NC}"
+    echo ""
+    echo -e "${YELLOW}注意: certbot 会要求你在域名管理面板添加 TXT 记录${NC}"
+    echo -e "${YELLOW}      请在另一个终端或浏览器中完成 DNS 验证${NC}"
+    echo ""
+    read -p "是否继续? [Y/n]: " proceed
+    if [[ "$proceed" =~ ^[Nn]$ ]]; then
+        return 1
+    fi
+
+    # 检查certbot是否安装
+    if ! command -v certbot &> /dev/null; then
+        log_warning "certbot 未安装，正在安装..."
+        if command -v apt &> /dev/null; then
+            sudo apt update && sudo apt install -y certbot
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y certbot
+        else
+            log_error "无法自动安装 certbot，请手动安装后重试"
+            echo -e "  ${CYAN}Ubuntu/Debian: sudo apt install certbot${NC}"
+            echo -e "  ${CYAN}CentOS/RHEL:   sudo yum install certbot${NC}"
+            return 1
+        fi
+    fi
+
+    # 执行certbot（通配符必须用DNS验证）
+    sudo certbot certonly --manual --preferred-challenges dns \
+        -d "*.${input_domain}" -d "${input_domain}"
+
+    if [ $? -eq 0 ]; then
+        log_success "通配符证书申请成功！"
+
+        # 查找生成的证书
+        local cert_path="/etc/letsencrypt/live/${input_domain}/fullchain.pem"
+        local key_path="/etc/letsencrypt/live/${input_domain}/privkey.pem"
+
+        if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+            echo ""
+            echo -e "  证书: ${cert_path}"
+            echo -e "  私钥: ${key_path}"
+
+            # 显示SAN信息
+            if command -v openssl &> /dev/null; then
+                local sans=$(openssl x509 -in "$cert_path" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/DNS://g; s/,//g; s/^\s*//')
+                echo -e "  SAN:  ${sans}"
+            fi
+
+            echo ""
+            read -p "是否部署此证书到 OTA-QL? [Y/n]: " deploy_confirm
+            if [[ ! "$deploy_confirm" =~ ^[Nn]$ ]]; then
+                deploy_cert_to_ota "$cert_path" "$key_path" "通配符证书 (*.${input_domain})"
+                return $?
+            fi
+        else
+            log_warning "证书文件未在预期路径找到，请手动检查 /etc/letsencrypt/live/"
+            return 1
+        fi
+    else
+        log_error "证书申请失败！"
+        echo ""
+        echo "  常见原因:"
+        echo "  1. DNS TXT 记录未添加或未生效"
+        echo "  2. 域名解析有问题"
+        echo "  3. certbot 版本过旧"
+        echo ""
+        return 1
+    fi
+}
+
+# 使用certbot申请SAN多域名证书
+apply_san_cert() {
+    echo ""
+    echo "=========================================="
+    echo "  申请 SAN 多域名证书"
+    echo "=========================================="
+    echo ""
+
+    local cb_addr=$(get_callback_addr)
+
+    echo -e "${BOLD}SAN 多域名证书说明:${NC}"
+    echo "  • 一张证书包含多个指定域名（SAN = Subject Alternative Name）"
+    echo "  • 例如: ota.wisefido.com + ota.wisefido.work 在同一张证书"
+    echo "  • 可以使用 HTTP 验证（端口80）或 DNS 验证"
+    echo ""
+
+    if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo -e "  当前回调域名: ${CYAN}${cb_addr}${NC}"
+        echo ""
+    fi
+
+    echo "请输入要包含的域名（空格分隔，至少2个）"
+    echo -e "  示例: ${CYAN}ota.wisefido.com ota.wisefido.work${NC}"
+    echo ""
+    read -p "域名列表: " domain_list
+
+    if [ -z "$domain_list" ]; then
+        log_warning "未输入域名，取消操作"
+        return 1
+    fi
+
+    # 构建 -d 参数
+    local certbot_args=""
+    local first_domain=""
+    local domain_count=0
+    for d in $domain_list; do
+        certbot_args="${certbot_args} -d ${d}"
+        if [ -z "$first_domain" ]; then
+            first_domain="$d"
+        fi
+        domain_count=$((domain_count + 1))
+    done
+
+    if [ $domain_count -lt 1 ]; then
+        log_warning "请输入至少一个域名"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${BOLD}选择验证方式:${NC}"
+    echo "  1. HTTP 验证（--standalone，需要端口80空闲）"
+    echo "  2. DNS 验证（--manual --preferred-challenges dns，需手动添加TXT记录）"
+    echo "  3. Nginx 插件（--nginx，需已安装 certbot-nginx）"
+    echo ""
+    read -p "请选择 [1-3]: " verify_method
+
+    local verify_args=""
+    case $verify_method in
+        1)
+            verify_args="--standalone"
+            echo ""
+            echo -e "${YELLOW}注意: HTTP 验证需要端口 80 空闲${NC}"
+            echo -e "${YELLOW}      如 Nginx 占用端口 80，请先停止: sudo systemctl stop nginx${NC}"
+            ;;
+        2)
+            verify_args="--manual --preferred-challenges dns"
+            echo ""
+            echo -e "${YELLOW}注意: DNS 验证需要手动在域名管理面板添加 TXT 记录${NC}"
+            ;;
+        3)
+            verify_args="--nginx"
+            ;;
+        *)
+            verify_args="--standalone"
+            ;;
+    esac
+
+    echo ""
+    echo -e "${BOLD}即将执行:${NC}"
+    echo -e "  ${CYAN}sudo certbot certonly ${verify_args}${certbot_args}${NC}"
+    echo ""
+    read -p "是否继续? [Y/n]: " proceed
+    if [[ "$proceed" =~ ^[Nn]$ ]]; then
+        return 1
+    fi
+
+    # 检查certbot
+    if ! command -v certbot &> /dev/null; then
+        log_warning "certbot 未安装，正在安装..."
+        if command -v apt &> /dev/null; then
+            sudo apt update && sudo apt install -y certbot
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y certbot
+        else
+            log_error "无法自动安装 certbot，请手动安装"
+            return 1
+        fi
+    fi
+
+    # 执行certbot
+    sudo certbot certonly ${verify_args} ${certbot_args}
+
+    if [ $? -eq 0 ]; then
+        log_success "SAN 多域名证书申请成功！"
+
+        # 查找证书
+        local cert_path="/etc/letsencrypt/live/${first_domain}/fullchain.pem"
+        local key_path="/etc/letsencrypt/live/${first_domain}/privkey.pem"
+
+        if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+            echo ""
+            echo -e "  证书: ${cert_path}"
+            echo -e "  私钥: ${key_path}"
+
+            if command -v openssl &> /dev/null; then
+                local sans=$(openssl x509 -in "$cert_path" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/DNS://g; s/,//g; s/^\s*//')
+                echo -e "  SAN:  ${sans}"
+            fi
+
+            echo ""
+            read -p "是否部署此证书到 OTA-QL? [Y/n]: " deploy_confirm
+            if [[ ! "$deploy_confirm" =~ ^[Nn]$ ]]; then
+                deploy_cert_to_ota "$cert_path" "$key_path" "SAN多域名证书 (${domain_list})"
+                return $?
+            fi
+        else
+            # 尝试查找其他可能的路径
+            log_warning "证书未在预期路径 ${cert_path} 找到"
+            echo "  正在搜索 /etc/letsencrypt/live/ 目录..."
+            ls -la /etc/letsencrypt/live/ 2>/dev/null
+            return 1
+        fi
+    else
+        log_error "证书申请失败！"
+        echo ""
+        echo "  常见原因:"
+        echo "  1. 端口80被占用（HTTP验证）"
+        echo "  2. DNS TXT 记录未添加（DNS验证）"
+        echo "  3. 域名未指向本服务器IP"
+        echo ""
+        return 1
+    fi
+}
+
+# v5.2: 部署时的SSL证书交互式菜单
+# 替代v5.0的auto_detect_and_deploy_certs，由用户主动选择证书获取方式
+deploy_cert_interactive_menu() {
+    echo ""
+    echo "=========================================="
+    echo "  SSL 证书配置 (v5.2)"
+    echo "=========================================="
+    echo ""
+
+    # 检查是否已有证书
+    if [ -f "${CERTS_DIR}/fullchain.pem" ] && [ -f "${CERTS_DIR}/privkey.pem" ]; then
+        echo -e "  ${GREEN}✓${NC} 已有证书文件: ${CERTS_DIR}/"
+        if command -v openssl &> /dev/null; then
+            local existing_cn=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1)
+            local existing_sans=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/DNS://g; s/,//g; s/^\s*//')
+            local existing_expiry=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+            echo -e "  域名: ${existing_cn}"
+            echo -e "  SAN:  ${existing_sans}"
+            echo -e "  到期: ${existing_expiry}"
+        fi
+        echo ""
+        read -p "是否重新配置证书? [y/N]: " reconfig
+        if [[ ! "$reconfig" =~ ^[Yy]$ ]]; then
+            log_info "保留现有证书，继续部署"
+            return 0
+        fi
+    fi
+
+    echo -e "${BOLD}ESP32 设备需要 CA 签发证书才能通过 TLS 验证${NC}"
+    echo -e "${BOLD}请选择证书配置方式:${NC}"
+    echo ""
+    echo "  1. 搜索已有证书（从宝塔/1Panel/Certbot等面板路径搜索）"
+    echo "  2. 申请通配符证书（*.domain.com，覆盖所有子域名）"
+    echo "  3. 申请 SAN 多域名证书（指定多个域名写入一张证书）"
+    echo "  0. 跳过（使用自签名证书，ESP32设备可能无法连接）"
+    echo ""
+    read -p "请选择 [0-3]: " cert_menu_choice
+
+    case $cert_menu_choice in
+        1)
+            # 搜索已有证书（复用原 auto_detect_and_deploy_certs 的搜索逻辑）
+            auto_detect_and_deploy_certs
+            # 搜索完毕后检查是否成功部署
+            if [ ! -f "${CERTS_DIR}/fullchain.pem" ] || [ ! -f "${CERTS_DIR}/privkey.pem" ]; then
+                echo ""
+                log_warning "未成功部署证书"
+                echo ""
+                echo "  是否尝试其他方式？"
+                echo "  2. 申请通配符证书"
+                echo "  3. 申请 SAN 多域名证书"
+                echo "  0. 跳过"
+                echo ""
+                read -p "请选择 [0/2/3]: " retry_choice
+                case $retry_choice in
+                    2) apply_wildcard_cert ;;
+                    3) apply_san_cert ;;
+                    *) log_info "跳过证书配置（将使用自签名证书）" ;;
+                esac
+            fi
+            ;;
+        2)
+            apply_wildcard_cert
+            if [ $? -ne 0 ]; then
+                echo ""
+                log_warning "通配符证书申请失败"
+                echo "  是否尝试其他方式？"
+                echo "  1. 搜索已有证书"
+                echo "  3. 申请 SAN 多域名证书"
+                echo "  0. 跳过"
+                echo ""
+                read -p "请选择 [0/1/3]: " retry_choice
+                case $retry_choice in
+                    1) auto_detect_and_deploy_certs ;;
+                    3) apply_san_cert ;;
+                    *) log_info "跳过证书配置（将使用自签名证书）" ;;
+                esac
+            fi
+            ;;
+        3)
+            apply_san_cert
+            if [ $? -ne 0 ]; then
+                echo ""
+                log_warning "SAN 多域名证书申请失败"
+                echo "  是否尝试其他方式？"
+                echo "  1. 搜索已有证书"
+                echo "  2. 申请通配符证书"
+                echo "  0. 跳过"
+                echo ""
+                read -p "请选择 [0/1/2]: " retry_choice
+                case $retry_choice in
+                    1) auto_detect_and_deploy_certs ;;
+                    2) apply_wildcard_cert ;;
+                    *) log_info "跳过证书配置（将使用自签名证书）" ;;
+                esac
+            fi
+            ;;
+        0|"")
+            log_info "跳过证书配置（将使用自签名证书）"
+            echo -e "  ${YELLOW}ESP32设备可能无法通过TLS证书验证${NC}"
+            echo -e "  ${YELLOW}部署后可通过菜单 [11. SSL证书管理] 配置证书${NC}"
+            echo ""
+            ;;
+        *)
+            log_warning "无效选择，跳过证书配置"
+            ;;
+    esac
+}
+
+# ============================================================================
 # 部署入口
 # ============================================================================
 
@@ -1823,8 +2187,8 @@ deploy_container() {
         SERVER_ADDR="${SAVED_ADDR}"
     fi
 
-    # v5.0: 自动检测并部署SSL证书（从宝塔/1Panel/Certbot等面板路径搜索）
-    auto_detect_and_deploy_certs
+    # v5.2: SSL证书配置（交互式菜单，替代v5.0的自动搜索）
+    deploy_cert_interactive_menu
 
     if ! check_port_conflicts; then
         return 1
@@ -2553,7 +2917,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "=========================================="
-        echo "  OTA-QL 管理工具 (v5.1)"
+        echo "  OTA-QL 管理工具 (v5.2)"
         echo "=========================================="
         echo ""
         echo -e "  ${GREEN}1.${NC}  一键部署 ${GREEN}(生产环境-安全)${NC}"
@@ -2657,7 +3021,7 @@ main() {
     echo ""
     echo "=========================================="
     echo "  OTA-QL Docker 部署管理工具"
-    echo "  版本: v5.0 | 清澜雷达 OTA 升级系统"
+    echo "  版本: v5.2 | 清澜雷达 OTA 升级系统"
     echo "  服务: HTTPS/HTTP_FW/GW/MQTT/MQTTS (5端口)"
     echo "=========================================="
     echo ""
