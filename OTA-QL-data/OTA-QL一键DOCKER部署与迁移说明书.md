@@ -1,6 +1,6 @@
 # 🐳 OTA-QL 一键 Docker 部署与迁移说明书
 
-> **版本**: v5.2
+> **版本**: v5.3
 > **适用项目**: OTA-QL — ESP32 雷达固件 OTA 升级管理服务
 > **最后更新**: 2026-03-08
 
@@ -74,7 +74,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 ### 2.3 部署流程概览
 
 ```
-执行脚本 → 选择环境(生产/测试) → 设置设备回调地址 → 🆕SSL证书配置(交互式) → 自动拉取镜像 → 创建数据卷 → 启动容器 → 健康检查 → 显示密码+回调地址
+执行脚本 → 选择环境(生产/测试) → 设置设备回调地址 → 🆕SSL证书配置(交互式+覆盖检查) → 自动拉取镜像 → 创建数据卷 → 启动容器 → 健康检查 → 显示密码+回调地址
 ```
 
 ---
@@ -88,7 +88,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 1. ✅ 检测 Docker 是否安装（未安装则自动安装）
 2. ✅ 创建数据卷目录
 3. ✅ **交互式设置设备回调地址**（域名或IP）
-4. 🆕 **SSL证书配置**（交互式菜单：搜索已有/申请通配符/申请SAN多域名）
+4. 🆕 **SSL证书配置**（交互式菜单：搜索已有/通配符/SAN多域名/覆盖检查/交互式申请）
 5. ✅ 检查端口冲突
 6. ✅ 拉取最新镜像
 7. ✅ 启动容器（5端口映射 + 回调地址环境变量）
@@ -121,7 +121,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 
 ```
 ==========================================
-  OTA-QL 管理工具 (v5.2)
+  OTA-QL 管理工具 (v5.3)
 ==========================================
 
   1.  一键部署 (生产环境-安全)
@@ -291,7 +291,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 
 ### 4.10 SSL 证书管理（菜单 11）🆕
 
-进入后包含六个子菜单：
+进入后包含九个子菜单：
 
 | 子菜单 | 功能 |
 |-------|------|
@@ -301,6 +301,9 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 | **4. 手动部署证书** | 手动输入证书路径，验证后复制到 OTA-QL 目录 |
 | **5. 证书配置指南** | 显示各面板（宝塔/aaPanel/ACME）证书位置说明 |
 | **6. 跨域名证书部署** | 搜索证书并分析 SAN 覆盖范围，单证书服务多域名（v5.1） |
+| **7. 查询证书覆盖情况** | 检查证书SAN是否覆盖回调地址/网关/Web面板（v5.3） |
+| **8. 交互式申请 SAN 证书** | 引导式填写多域名+选择验证方式，一键申请并部署（v5.3） |
+| **9. 交互式申请通配符证书** | 引导式填写基础域名+DNS验证指引，一键申请并部署（v5.3） |
 
 ---
 
@@ -704,13 +707,16 @@ sudo firewall-cmd --reload
 
 ### 6.7 多域名证书申请与部署（v5.2 新增）
 
-v5.2 起，部署时的 SSL 证书配置改为交互式菜单，用户可选择三种方式：
+v5.3 起，部署时的 SSL 证书配置改为交互式菜单，用户可选择七种方式：
 
 | 选项 | 方式 | 说明 |
 |------|------|------|
 | 1 | 搜索已有证书 | 从宝塔/1Panel/Certbot等17种面板路径搜索已申请的证书 |
 | 2 | 申请通配符证书 | `*.domain.com` 覆盖所有子域名（需DNS验证） |
 | 3 | 申请SAN多域名证书 | 指定多个域名写入同一张证书（支持HTTP/DNS验证） |
+| 4 | 查询证书覆盖情况 | 检查当前证书SAN是否覆盖回调地址/网关/Web面板 |
+| 5 | 交互式申请SAN证书 | 引导式填写域名+选择验证方式，一键申请 |
+| 6 | 交互式申请通配符证书 | 引导式填写基础域名+DNS验证指引，一键申请 |
 | 0 | 跳过 | 使用自签名证书，ESP32可能无法连接 |
 
 **通配符证书申请示例：**
@@ -740,9 +746,144 @@ sudo certbot certonly --manual --preferred-challenges dns \
 
 **失败重试机制：** 当选择的方式失败后，脚本会提示尝试其他方式，全部失败后跳过证书配置继续部署（使用自签名证书）。
 
+### 6.8 跨域名证书部署详解（v5.3 新增）
+
+#### 什么是"跨域名证书部署"？
+
+**一句话说明**：用一张 SSL 证书同时服务多个域名，让所有域名的 ESP32 设备都能通过 TLS 验证。
+
+#### 为什么需要跨域名？
+
+典型场景：生产域名 `ota.wisefido.com` 和测试域名 `ota.wisefido.work` 指向同一台服务器。OTA-QL Go 服务器只加载**一份证书文件**（`/opt/ota-ql/certs/fullchain.pem`），如果证书只包含一个域名，另一个域名的设备连接时 TLS 握手会失败。
+
+#### 三种解决方案
+
+| 方案 | 证书类型 | 覆盖域名 | 限制 | 推荐场景 |
+|------|---------|---------|------|---------|
+| **方案A** | SAN多域名证书 | 精确指定的域名列表 | 需逐个列出域名 | 不同基础域名（.com + .work） |
+| **方案B** | 通配符证书 | `*.domain.com` 所有子域名 | 只能覆盖**同一基础域名** | 同一域名下多个子域名 |
+| **方案C** | 两张独立证书 | 各自覆盖一个域名 | OTA-QL只能加载一张 | ❌ 不适用 |
+
+#### 方案A详解：SAN多域名证书（推荐）
+
+**适用场景**：`ota.wisefido.com` + `ota.wisefido.work`（不同基础域名）
+
+```bash
+# 步骤1: 用 certbot 申请包含两个域名的证书
+sudo certbot certonly --standalone \
+    -d ota.wisefido.com -d ota.wisefido.work
+
+# 步骤2: 证书生成位置
+/etc/letsencrypt/live/ota.wisefido.com/fullchain.pem
+/etc/letsencrypt/live/ota.wisefido.com/privkey.pem
+
+# 步骤3: 部署到 OTA-QL
+sudo cp /etc/letsencrypt/live/ota.wisefido.com/fullchain.pem /opt/ota-ql/certs/
+sudo cp /etc/letsencrypt/live/ota.wisefido.com/privkey.pem /opt/ota-ql/certs/
+docker restart ota-ql
+```
+
+**验证证书SAN覆盖：**
+
+```bash
+openssl x509 -in /opt/ota-ql/certs/fullchain.pem -noout -text | grep -A1 "Subject Alternative Name"
+# 应显示: DNS:ota.wisefido.com, DNS:ota.wisefido.work
+```
+
+**数据流：**
+
+```
+设备A（NVS server=ota.wisefido.com）→ :10086 认证 → 回调 ota.wisefido.com:8883
+设备B（NVS server=ota.wisefido.work）→ :10086 认证 → 回调 ota.wisefido.com:8883
+
+证书SAN: ota.wisefido.com + ota.wisefido.work
+  → ESP32 连 :8883 用 ota.wisefido.com → 匹配SAN → ✅ TLS通过
+  → ESP32 连 :10086 用 ota.wisefido.work → 匹配SAN → ✅ TLS通过
+```
+
+#### 方案B详解：通配符证书
+
+**适用场景**：同一基础域名下多个子域名（如 `ota.wisefido.com` + `api.wisefido.com`）
+
+```bash
+# 申请通配符证书（必须使用DNS验证）
+sudo certbot certonly --manual --preferred-challenges dns \
+    -d "*.wisefido.com" -d "wisefido.com"
+
+# certbot 会要求添加 DNS TXT 记录:
+#   _acme-challenge.wisefido.com → TXT → (certbot提供的值)
+# 到域名管理面板（阿里云/腾讯云/Cloudflare）添加后按回车继续
+```
+
+> ⚠️ **重要限制**：`*.wisefido.com` 只覆盖 `.wisefido.com` 的子域名。如果还有 `.wisefido.work` 域名，需要额外用 SAN 证书或再申请一张 `*.wisefido.work` 的通配符证书。
+
+#### 使用脚本菜单操作（推荐）
+
+**方式一：部署时交互式菜单**
+
+```
+部署选择 SSL 证书配置
+  → 选择 5. 交互式申请 SAN 多域名证书
+  → 输入: ota.wisefido.com ota.wisefido.work
+  → 选择验证方式（HTTP/DNS/Nginx）
+  → certbot 自动申请并部署
+```
+
+**方式二：SSL证书管理菜单（菜单11）**
+
+```
+菜单 11. SSL证书管理
+  → 7. 查询证书覆盖情况   ← 先检查当前证书覆盖了哪些域名
+  → 8. 交互式申请 SAN 证书  ← 申请覆盖多域名的新证书
+  → 9. 交互式申请通配符证书  ← 或申请覆盖所有子域名的证书
+```
+
+**方式三：跨域名证书部署（菜单11 → 6）**
+
+```
+菜单 11. SSL证书管理 → 6. 跨域名证书部署
+  → 自动搜索系统中所有证书
+  → 显示每张证书的 SAN 域名列表
+  → 标注 ✓ 覆盖回调域名 / ⚠ 未覆盖
+  → 选择一张覆盖最多域名的证书部署
+```
+
+#### 证书覆盖检查功能（v5.3 新增）
+
+部署时或任何时候可通过菜单检查当前证书是否覆盖所有服务地址：
+
+```
+SSL 证书覆盖检查 (v5.3)
+
+[证书基本信息]
+  CN:     ota.wisefido.com
+  颁发者: R11
+  到期:   Mar 15 2026
+  SAN 域名 (2个):
+    • ota.wisefido.com
+    • ota.wisefido.work
+
+[服务地址覆盖检查]
+
+  ① 设备回调地址（MQTT Broker）
+      地址: ota.wisefido.com:8883
+      状态: ✓ 已覆盖 — 证书SAN包含此域名
+
+  ② 设备认证网关（cmux 网关）
+      地址: ota.wisefido.com:10086
+      状态: ✓ 已覆盖 — 证书SAN包含此域名
+
+  ③ Web管理面板（HTTPS）
+      说明: 生产环境通过 Nginx :443 反代，Nginx用自己的证书
+
+[覆盖总结]
+  ✓ 所有服务域名均被证书覆盖，ESP32设备可正常连接
+```
+
 ---
 
 > ⚡ **版本历史**:
+> **v5.3** (2026-03-08) — SSL证书管理菜单扩展至9项（新增覆盖检查/交互式SAN/交互式通配符），部署菜单扩展至7项，新增跨域名证书部署详解（6.8章节）
 > **v5.2** (2026-03-08) — 部署时SSL证书配置改为交互式菜单（搜索已有/通配符/SAN多域名），新增多域名证书申请指导
 > **v5.1** (2026-03-08) — 修复证书搜索重复误报BUG（realpath去重），新增跨域名证书部署（菜单11→子菜单6）
 > **v5.0** (2026-03-08) — 新增 SSL 证书管理（章节6 + 菜单11），内置17种面板路径数据库，部署时自动搜索并部署证书

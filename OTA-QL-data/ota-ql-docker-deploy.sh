@@ -5,7 +5,7 @@
 # 文件名: ota-ql-docker-deploy.sh
 # 用途: 首次部署、滚动更新、备份恢复、密码重置、存储卷检查、日志管理、SSL证书管理
 # 作者: WiseFido Technologies
-# 版本: v5.2
+# 版本: v5.3
 # 更新: 2026-03-08
 #
 # 一键部署（推荐）:
@@ -319,7 +319,7 @@ start_new_container() {
     # v5.0: 自动检测并加载TLS证书（解决ESP32 esp-x509-crt-bundle验证自签名证书失败）
     # 证书用于: cmux设备网关(10086) + MQTTS(8883) + HTTPS(10088) 的TLS握手
     # 宝塔Nginx的证书只管浏览器访问，设备直连端口需要Go服务器自己的证书
-    # 证书由 deploy_container() → auto_detect_and_deploy_certs() 自动搜索部署
+    # 证书由 deploy_container() → deploy_cert_interactive_menu() 交互式配置部署
     local TLS_ENV_ARGS=""
     local CERT_FILE="${CERTS_DIR}/fullchain.pem"
     local KEY_FILE="${CERTS_DIR}/privkey.pem"
@@ -1686,9 +1686,12 @@ menu_cert_management() {
     echo "  4. 手动指定证书路径"
     echo "  5. SSL证书申请指南"
     echo "  6. 跨域名证书部署（单证书覆盖多域名）"
+    echo "  7. 查询证书覆盖情况（回调/网关/Web面板）"
+    echo "  8. 交互式申请 SAN 多域名证书"
+    echo "  9. 交互式申请通配符证书"
     echo "  0. 返回主菜单"
     echo ""
-    read -p "请选择 [0-6]: " cert_choice
+    read -p "请选择 [0-9]: " cert_choice
 
     case $cert_choice in
         1)
@@ -1753,6 +1756,15 @@ menu_cert_management() {
         6)
             deploy_cert_cross_domain
             ;;
+        7)
+            check_cert_coverage
+            ;;
+        8)
+            apply_san_cert
+            ;;
+        9)
+            apply_wildcard_cert
+            ;;
         0)
             return 0
             ;;
@@ -1776,8 +1788,197 @@ get_public_ip() {
 }
 
 # ============================================================================
-# v5.2: 部署时SSL证书交互式菜单（替代v5.0的auto_detect_and_deploy_certs）
+# v5.3: SSL证书覆盖检查 + 交互式证书申请
 # ============================================================================
+
+# v5.3: 查询当前证书对各服务地址的覆盖情况
+# 检查证书SAN是否覆盖: 设备回调地址、设备认证网关地址、Web面板地址
+check_cert_coverage() {
+    echo ""
+    echo "=========================================="
+    echo "  SSL 证书覆盖检查 (v5.3)"
+    echo "=========================================="
+    echo ""
+
+    local cert_file="${CERTS_DIR}/fullchain.pem"
+    local key_file="${CERTS_DIR}/privkey.pem"
+
+    # --- 1. 检查证书是否存在 ---
+    if [ ! -f "$cert_file" ]; then
+        echo -e "  ${RED}✗${NC} 未部署 CA 签发证书"
+        echo -e "  ${YELLOW}Go 服务器正使用自签名证书，ESP32 设备无法通过 TLS 验证${NC}"
+        echo ""
+        echo "  请通过以下方式配置证书:"
+        echo "  • 菜单 [11. SSL证书管理] → 搜索/申请证书"
+        echo "  • 部署时选择证书配置方式（搜索/通配符/SAN）"
+        echo ""
+        return 1
+    fi
+
+    # --- 2. 获取证书信息 ---
+    local cert_cn="" cert_sans="" cert_expiry="" cert_issuer=""
+    local san_list=()
+    if command -v openssl &> /dev/null; then
+        cert_cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1)
+        cert_issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1)
+        cert_expiry=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+        local sans_raw=$(openssl x509 -in "$cert_file" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/^\s*//')
+        # 解析SAN列表
+        local IFS_OLD="$IFS"
+        IFS=','
+        for entry in $sans_raw; do
+            entry=$(echo "$entry" | sed 's/DNS://g; s/^\s*//; s/\s*$//')
+            if [ -n "$entry" ]; then
+                san_list+=("$entry")
+            fi
+        done
+        IFS="$IFS_OLD"
+    else
+        echo -e "  ${YELLOW}⚠ 未安装 openssl，无法解析证书信息${NC}"
+        return 1
+    fi
+
+    echo -e "${BOLD}[证书基本信息]${NC}"
+    echo -e "  CN:     ${cert_cn}"
+    echo -e "  颁发者: ${cert_issuer}"
+    echo -e "  到期:   ${cert_expiry}"
+    echo -e "  SAN 域名 (${#san_list[@]}个):"
+    for s in "${san_list[@]}"; do
+        echo -e "    • ${s}"
+    done
+    echo ""
+
+    # --- 3. 定义需要检查的服务地址 ---
+    local cb_addr=$(get_callback_addr)
+    local gw_addr=""   # 设备认证网关地址（与回调地址相同，用:10086端口）
+    local web_addr=""  # Web面板地址
+
+    # 设备认证网关地址 = 设备NVS中存储的server地址 → 连接 :10086
+    # 通常与回调地址相同，但设备也可以用其他域名连接网关
+    gw_addr="$cb_addr"
+
+    # Web面板地址（如果Nginx反代了443，则可能是域名:443→127.0.0.1:10088）
+    # 这里检查回调域名是否被覆盖即可，因为Web面板通常走Nginx的证书
+    web_addr="$cb_addr"
+
+    echo -e "${BOLD}[服务地址覆盖检查]${NC}"
+    echo ""
+
+    # 辅助函数: 检查域名是否被SAN列表覆盖
+    check_domain_covered() {
+        local domain="$1"
+        if [ -z "$domain" ]; then return 1; fi
+        # 如果是IP地址，不做域名匹配
+        if echo "$domain" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then return 2; fi
+        for san in "${san_list[@]}"; do
+            # 精确匹配
+            if [ "$san" = "$domain" ]; then return 0; fi
+            # 通配符匹配: *.wisefido.com 匹配 ota.wisefido.com
+            if echo "$san" | grep -q '^\*\.'; then
+                local wc_base="${san#\*.}"
+                if echo "$domain" | grep -qE "^[^.]+\.${wc_base//./\\.}$"; then
+                    return 0
+                fi
+            fi
+        done
+        return 1
+    }
+
+    # 检查函数: 输出一行覆盖状态
+    print_coverage() {
+        local label="$1"
+        local addr="$2"
+        local port="$3"
+        local cert_source="$4"   # "Go服务器" 或 "Nginx"
+
+        if [ -z "$addr" ]; then
+            echo -e "  ${YELLOW}?${NC} ${label}"
+            echo -e "      地址: 未配置"
+            echo -e "      状态: ${YELLOW}未设置回调地址（或为IP），无法检查${NC}"
+            echo ""
+            return
+        fi
+
+        echo -e "  ${BOLD}${label}${NC}"
+        echo -e "      地址: ${addr}:${port}"
+        echo -e "      证书: ${cert_source}"
+
+        if echo "$addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo -e "      状态: ${YELLOW}⚠ 使用IP地址，证书域名匹配不适用${NC}"
+            echo -e "      说明: IP地址不做域名匹配，ESP32需信任证书CA即可"
+        else
+            check_domain_covered "$addr"
+            local result=$?
+            if [ $result -eq 0 ]; then
+                echo -e "      状态: ${GREEN}✓ 已覆盖${NC} — 证书SAN包含此域名"
+            else
+                echo -e "      状态: ${RED}✗ 未覆盖${NC} — 证书SAN不包含 ${addr}"
+                echo -e "      ${RED}⚠ ESP32设备可能因域名不匹配拒绝TLS连接${NC}"
+            fi
+        fi
+        echo ""
+    }
+
+    # --- 4. 逐项检查 ---
+
+    # 4a. 设备回调地址（MQTT Broker地址: cb_addr:8883）
+    print_coverage "① 设备回调地址（MQTT Broker）" "$cb_addr" "${MQTTS_PORT}" "Go服务器 (${CERTS_DIR}/)"
+
+    # 4b. 设备认证网关（cmux网关: gw_addr:10086）
+    print_coverage "② 设备认证网关（cmux 网关）" "$gw_addr" "${GW_PORT}" "Go服务器 (${CERTS_DIR}/)"
+
+    # 4c. Web管理面板
+    echo -e "  ${BOLD}③ Web管理面板（HTTPS）${NC}"
+    echo -e "      地址: :${HTTPS_PORT} (Go服务器直接)"
+    echo -e "      证书: Go服务器 (${CERTS_DIR}/)"
+    echo -e "      说明: 生产环境通过 Nginx :443 反代访问"
+    echo -e "             Nginx使用自己的Let's Encrypt证书（宝塔管理）"
+    echo -e "             Go服务器:10088端口的证书主要给直连场景使用"
+    if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        check_domain_covered "$cb_addr"
+        if [ $? -eq 0 ]; then
+            echo -e "      状态: ${GREEN}✓ Go证书覆盖 ${cb_addr}${NC}"
+        else
+            echo -e "      状态: ${YELLOW}⚠ Go证书未覆盖 ${cb_addr}（但通常走Nginx:443，不影响）${NC}"
+        fi
+    fi
+    echo ""
+
+    # --- 5. 总结 ---
+    echo -e "${BOLD}[覆盖总结]${NC}"
+    echo ""
+    local total_ok=0
+    local total_warn=0
+    local total_fail=0
+
+    if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        check_domain_covered "$cb_addr"
+        if [ $? -eq 0 ]; then
+            total_ok=$((total_ok + 1))
+            echo -e "  ${GREEN}✓${NC} 回调域名 ${cb_addr} → 被证书覆盖"
+        else
+            total_fail=$((total_fail + 1))
+            echo -e "  ${RED}✗${NC} 回调域名 ${cb_addr} → 未被证书覆盖"
+        fi
+    else
+        total_warn=$((total_warn + 1))
+        echo -e "  ${YELLOW}⚠${NC} 回调地址为IP或未设置 → 跳过域名检查"
+    fi
+
+    echo ""
+    if [ $total_fail -gt 0 ]; then
+        echo -e "  ${RED}⚠ 存在未覆盖的域名！${NC}"
+        echo -e "  ${YELLOW}建议：申请包含所有域名的 SAN 证书或通配符证书${NC}"
+        echo ""
+        echo "  快速解决方案:"
+        echo -e "  ${CYAN}方案A:${NC} 申请通配符证书 → SSL证书管理 → 申请通配符证书"
+        echo -e "  ${CYAN}方案B:${NC} 申请SAN多域名证书 → SSL证书管理 → 申请SAN证书"
+    elif [ $total_ok -gt 0 ]; then
+        echo -e "  ${GREEN}✓ 所有服务域名均被证书覆盖，ESP32设备可正常连接${NC}"
+    fi
+
+    echo ""
+}
 
 # 使用certbot申请通配符证书（需DNS验证）
 apply_wildcard_cert() {
@@ -2031,12 +2232,12 @@ apply_san_cert() {
     fi
 }
 
-# v5.2: 部署时的SSL证书交互式菜单
+# v5.3: 部署时的SSL证书交互式菜单
 # 替代v5.0的auto_detect_and_deploy_certs，由用户主动选择证书获取方式
 deploy_cert_interactive_menu() {
     echo ""
     echo "=========================================="
-    echo "  SSL 证书配置 (v5.2)"
+    echo "  SSL 证书配置 (v5.3)"
     echo "=========================================="
     echo ""
 
@@ -2065,9 +2266,12 @@ deploy_cert_interactive_menu() {
     echo "  1. 搜索已有证书（从宝塔/1Panel/Certbot等面板路径搜索）"
     echo "  2. 申请通配符证书（*.domain.com，覆盖所有子域名）"
     echo "  3. 申请 SAN 多域名证书（指定多个域名写入一张证书）"
+    echo "  4. 查询证书覆盖情况（检查回调地址/网关/Web面板）"
+    echo "  5. 交互式申请 SAN 多域名证书（引导式填写域名+选验证方式）"
+    echo "  6. 交互式申请通配符证书（引导式填写域名+DNS验证指引）"
     echo "  0. 跳过（使用自签名证书，ESP32设备可能无法连接）"
     echo ""
-    read -p "请选择 [0-3]: " cert_menu_choice
+    read -p "请选择 [0-6]: " cert_menu_choice
 
     case $cert_menu_choice in
         1)
@@ -2133,6 +2337,88 @@ deploy_cert_interactive_menu() {
             echo -e "  ${YELLOW}部署后可通过菜单 [11. SSL证书管理] 配置证书${NC}"
             echo ""
             ;;
+        4)
+            check_cert_coverage
+            echo ""
+            echo "  查看完毕后可选择其他方式配置证书:"
+            echo "  1. 搜索已有证书"
+            echo "  2. 申请通配符证书"
+            echo "  3. 申请 SAN 多域名证书"
+            echo "  0. 跳过"
+            echo ""
+            read -p "请选择 [0/1/2/3]: " retry_choice
+            case $retry_choice in
+                1) auto_detect_and_deploy_certs ;;
+                2) apply_wildcard_cert ;;
+                3) apply_san_cert ;;
+                *) log_info "跳过证书配置" ;;
+            esac
+            ;;
+        5)
+            # 交互式SAN证书：先查覆盖 → 引导填写域名 → 申请
+            echo ""
+            echo -e "${BOLD}交互式 SAN 多域名证书申请${NC}"
+            echo ""
+            # 先展示当前回调地址帮助用户决策
+            local cb_addr=$(get_callback_addr)
+            if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+                echo -e "  当前回调域名: ${CYAN}${cb_addr}${NC}"
+                echo -e "  建议至少包含此域名"
+                echo ""
+            fi
+            echo -e "  ${YELLOW}提示: SAN 证书可包含不同基础域名的域名${NC}"
+            echo -e "  ${YELLOW}      例如: ota.wisefido.com + ota.wisefido.work${NC}"
+            echo ""
+            apply_san_cert
+            if [ $? -ne 0 ]; then
+                echo ""
+                log_warning "SAN 证书申请失败"
+                echo "  是否尝试其他方式？"
+                echo "  1. 搜索已有证书"
+                echo "  2. 申请通配符证书"
+                echo "  0. 跳过"
+                echo ""
+                read -p "请选择 [0/1/2]: " retry_choice
+                case $retry_choice in
+                    1) auto_detect_and_deploy_certs ;;
+                    2) apply_wildcard_cert ;;
+                    *) log_info "跳过证书配置" ;;
+                esac
+            fi
+            ;;
+        6)
+            # 交互式通配符证书：先显示说明 → 引导DNS验证
+            echo ""
+            echo -e "${BOLD}交互式通配符证书申请${NC}"
+            echo ""
+            local cb_addr=$(get_callback_addr)
+            if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+                local inferred_base=$(echo "$cb_addr" | awk -F. '{if(NF>=2) print $(NF-1)"."$NF}')
+                echo -e "  当前回调域名: ${CYAN}${cb_addr}${NC}"
+                echo -e "  推测基础域名: ${CYAN}${inferred_base}${NC}"
+                echo -e "  通配符证书 *.${inferred_base} 将覆盖所有 ${inferred_base} 的子域名"
+                echo ""
+                echo -e "  ${YELLOW}⚠ 注意: 通配符仅覆盖同一基础域名的子域名${NC}"
+                echo -e "  ${YELLOW}  如需跨基础域名（如 .com + .work），请用 SAN 证书${NC}"
+                echo ""
+            fi
+            apply_wildcard_cert
+            if [ $? -ne 0 ]; then
+                echo ""
+                log_warning "通配符证书申请失败"
+                echo "  是否尝试其他方式？"
+                echo "  1. 搜索已有证书"
+                echo "  3. 申请 SAN 多域名证书"
+                echo "  0. 跳过"
+                echo ""
+                read -p "请选择 [0/1/3]: " retry_choice
+                case $retry_choice in
+                    1) auto_detect_and_deploy_certs ;;
+                    3) apply_san_cert ;;
+                    *) log_info "跳过证书配置" ;;
+                esac
+            fi
+            ;;
         *)
             log_warning "无效选择，跳过证书配置"
             ;;
@@ -2187,7 +2473,7 @@ deploy_container() {
         SERVER_ADDR="${SAVED_ADDR}"
     fi
 
-    # v5.2: SSL证书配置（交互式菜单，替代v5.0的自动搜索）
+    # v5.3: SSL证书配置（交互式菜单，含覆盖检查+SAN/通配符申请）
     deploy_cert_interactive_menu
 
     if ! check_port_conflicts; then
@@ -2917,7 +3203,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "=========================================="
-        echo "  OTA-QL 管理工具 (v5.2)"
+        echo "  OTA-QL 管理工具 (v5.3)"
         echo "=========================================="
         echo ""
         echo -e "  ${GREEN}1.${NC}  一键部署 ${GREEN}(生产环境-安全)${NC}"
@@ -3021,7 +3307,7 @@ main() {
     echo ""
     echo "=========================================="
     echo "  OTA-QL Docker 部署管理工具"
-    echo "  版本: v5.2 | 清澜雷达 OTA 升级系统"
+    echo "  版本: v5.3 | 清澜雷达 OTA 升级系统"
     echo "  服务: HTTPS/HTTP_FW/GW/MQTT/MQTTS (5端口)"
     echo "=========================================="
     echo ""
