@@ -2552,6 +2552,20 @@ show_production_deploy_success() {
 
     echo "[管理员账户]"
     show_password_info
+    # v8.6 P1: 首次部署时在成功摘要中也显示初始密码
+    local INIT_PWD=$(get_current_password)
+    if [ -n "$INIT_PWD" ] && [ "$INIT_PWD" != "" ]; then
+        echo ""
+        echo "┌────────────────────────────────────────────┐"
+        echo "│  🔐 新的管理员登录凭据（仅显示一次！）     │"
+        echo "├────────────────────────────────────────────┤"
+        echo -e "│  👤 用户名: ${GREEN}admin${NC}"
+        echo -e "│  🔑 密码:   ${GREEN}${INIT_PWD}${NC}"
+        echo "├────────────────────────────────────────────┤"
+        echo -e "│  ${RED}⚠️  请立即记录此密码！此后不再显示${NC}      │"
+        echo -e "│  ${YELLOW}⚠️  登录后请立即修改密码！${NC}              │"
+        echo "└────────────────────────────────────────────┘"
+    fi
     echo ""
 
     echo -e "${BG_GREEN}${BOLD}  安全说明  ${NC}"
@@ -2609,6 +2623,20 @@ show_test_deploy_success() {
 
     echo "[管理员账户]"
     show_password_info
+    # v8.6 P1: 首次部署时在成功摘要中也显示初始密码
+    local INIT_PWD_TEST=$(get_current_password)
+    if [ -n "$INIT_PWD_TEST" ] && [ "$INIT_PWD_TEST" != "" ]; then
+        echo ""
+        echo "┌────────────────────────────────────────────┐"
+        echo "│  🔐 新的管理员登录凭据（仅显示一次！）     │"
+        echo "├────────────────────────────────────────────┤"
+        echo -e "│  👤 用户名: ${GREEN}admin${NC}"
+        echo -e "│  🔑 密码:   ${GREEN}${INIT_PWD_TEST}${NC}"
+        echo "├────────────────────────────────────────────┤"
+        echo -e "│  ${RED}⚠️  请立即记录此密码！此后不再显示${NC}      │"
+        echo -e "│  ${YELLOW}⚠️  登录后请立即修改密码！${NC}              │"
+        echo "└────────────────────────────────────────────┘"
+    fi
     echo ""
 
     echo -e "${BG_RED}${BOLD}  ⚠️ 安全警告  ${NC}"
