@@ -1,6 +1,6 @@
 # 🐳 OTA-QL 一键 Docker 部署与迁移说明书
 
-> **版本**: v5.3
+> **版本**: v8.9
 > **适用项目**: OTA-QL — ESP32 雷达固件 OTA 升级管理服务
 > **最后更新**: 2026-03-08
 
@@ -19,6 +19,7 @@
 9. [服务器迁移](#9-服务器迁移)
 10. [故障排查](#10-故障排查)
 11. [公开仓库自动同步](#11-公开仓库自动同步)
+12. [服务器部署及反代设置（v8.9 新增）](#12-服务器部署及反代设置v89-新增)
 
 ---
 
@@ -35,13 +36,13 @@ OTA-QL 是清澜雷达（ESP32-S3）固件 OTA 远程升级管理服务，支持
 
 ### 1.2 服务端口
 
-| 服务 | 端口 | 协议 | 说明 |
-|------|------|------|------|
-| HTTPS 统一 | 10088 | HTTPS | Web 管理 + API |
-| HTTP 固件 | 10089 | HTTP | ESP32 OTA 明文固件下载 |
-| cmux 网关 | 10086 | TCP/TLS | 设备连接（自动识别协议） |
-| MQTT | 1883 | MQTT | 消息通信（明文） |
-| MQTTS | 8883 | MQTTS | 消息通信（TLS 加密） |
+| 服务 | 端口 | 协议 | 绑定 | 说明 |
+|------|------|------|------|------|
+| HTTPS 统一 | 10088 | HTTPS | 127.0.0.1 | Web 管理 + API（Nginx反代） |
+| HTTP 固件 | 10089 | HTTP | 127.0.0.1 | ESP32 OTA 固件下载（v8.9: Nginx /firmware 反代） |
+| cmux 网关 | 10086 | TCP/TLS | 0.0.0.0 | 设备连接（自动识别协议） |
+| MQTT | 1883 | MQTT | 0.0.0.0 | 消息通信（明文） |
+| MQTTS | 8883 | MQTTS | 0.0.0.0 | 消息通信（TLS 加密） |
 
 ### 1.3 Docker 镜像
 
@@ -61,7 +62,7 @@ ghcr.io/hhtbing-wisefido/ota-ql:latest
 | Docker | 20.10+ |
 | 内存 | ≥ 512MB |
 | 磁盘 | ≥ 1GB 可用空间 |
-| 网络 | 需要开放 10088/10089/10086/1883/8883 端口 |
+| 网络 | 需要开放 443/10086/1883/8883 端口（10088/10089 仅本地） |
 
 ### 2.2 一键部署（推荐）
 
@@ -74,7 +75,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 ### 2.3 部署流程概览
 
 ```
-执行脚本 → 选择环境(生产/测试) → 设置设备回调地址 → 🆕SSL证书配置(交互式+覆盖检查) → 自动拉取镜像 → 创建数据卷 → 启动容器 → 健康检查 → 显示密码+回调地址
+执行脚本 → 选择环境(生产/测试) → 设置设备回调地址 → 🆕设置固件下载域名 → 🆕SSL证书配置(交互式+覆盖检查) → 自动拉取镜像 → 创建数据卷 → 启动容器 → 健康检查 → 显示密码+回调地址+固件域名
 ```
 
 ---
@@ -88,12 +89,13 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 1. ✅ 检测 Docker 是否安装（未安装则自动安装）
 2. ✅ 创建数据卷目录
 3. ✅ **交互式设置设备回调地址**（域名或IP）
-4. 🆕 **SSL证书配置**（交互式菜单：搜索已有/通配符/SAN多域名/覆盖检查/交互式申请）
-5. ✅ 检查端口冲突
-6. ✅ 拉取最新镜像
-7. ✅ 启动容器（5端口映射 + 回调地址环境变量）
-8. ✅ 执行健康检查（HTTPS API + 设备网关 双重检测）
-9. ✅ 显示管理员初始密码 + 设备回调地址信息
+4. 🆕 **交互式设置固件下载域名**（OTA_FIRMWARE_URL_BASE，v8.9）
+5. 🆕 **SSL证书配置**（交互式菜单：搜索已有/通配符/SAN多域名/覆盖检查/交互式申请）
+6. ✅ 检查端口冲突
+7. ✅ 拉取最新镜像
+8. ✅ 启动容器（5端口映射 + 回调地址 + 固件域名环境变量）
+9. ✅ 执行健康检查（HTTPS API + 设备网关 双重检测）
+10. ✅ 显示管理员初始密码 + 设备回调地址 + 固件域名信息
 
 ### 3.2 环境选择
 
@@ -121,7 +123,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 
 ```
 ==========================================
-  OTA-QL 管理工具 (v5.3)
+  OTA-QL 管理工具 (v8.9)
 ==========================================
 
   1.  一键部署 (生产环境-安全)
@@ -135,15 +137,16 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
   9.  查看日志
   10. 设备回调地址设置与查看
   11. SSL证书管理 🆕
+  14. 固件下载域名设置与查看 🆕
   12. 退出
   13. 一键部署 (仅测试-不安全)
 ```
 
 ### 4.1 部署/更新服务（菜单 1 / 12）
 
-- **菜单 1 — 生产环境**: HTTPS管理绑定 127.0.0.1（Nginx反代），设备端口绑定 0.0.0.0
-- **菜单 12 — 测试环境**: 全部端口绑定 0.0.0.0（⚠️ 不安全）
-- 部署时会交互提示设置设备回调地址
+- **菜单 1 — 生产环境**: HTTPS管理+固件绑定 127.0.0.1（Nginx反代），设备端口绑定 0.0.0.0
+- **菜单 13 — 测试环境**: 全部端口绑定 0.0.0.0（⚠️ 不安全）
+- 部署时会交互提示设置设备回调地址和固件下载域名
 - **首次部署**: 全新安装，自动生成初始密码
 - **更新升级**: 备份当前镜像 → 拉取新镜像 → 重启容器 → 健康检查
 
@@ -224,7 +227,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 
 设备通过网关(:10086)连接服务器认证后，服务器返回此地址告诉设备：
 1. **MQTT Broker 地址**: `<回调地址>:8883`（MQTTS TLS）
-2. **OTA 固件下载地址**: `http://<回调地址>:10089/firmware`
+2. **OTA 固件下载地址**: `https://<固件域名>/firmware`（v8.9: 通过Nginx反代）
 
 简单理解：**设备认证后"回拨"到这个地址获取 MQTT 和固件服务**。
 
@@ -236,7 +239,7 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 | 配置方式 | 蓝牙配置（EspBlufi App） | 部署脚本交互输入 |
 | 使用时机 | 设备上电，发起认证 | 认证后，服务器返回给设备 |
 | 修改方式 | 逐台设备蓝牙配置 | 服务器一处修改，所有设备生效 |
-| 涉及端口 | :10086 | :8883, :10089 |
+| 涉及端口 | :10086 | :8883, :443/firmware |
 
 ### 5.3 设置方式
 
@@ -277,7 +280,10 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 [设备回调地址]
   ✓ 回调地址:   ota.wisefido.com
   MQTT地址:    ota.wisefido.com:8883 (MQTTS/TLS)
-  固件下载:    http://ota.wisefido.com:10089/firmware
+
+[固件下载域名]
+  ✓ 固件域名:   ota.wisefido.com
+  ✓ 固件URL:    https://ota.wisefido.com/firmware
 ```
 
 ### 5.5 域名 vs IP
@@ -304,6 +310,26 @@ wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisef
 | **7. 查询证书覆盖情况** | 检查证书SAN是否覆盖回调地址/网关/Web面板（v5.3） |
 | **8. 交互式申请 SAN 证书** | 引导式填写多域名+选择验证方式，一键申请并部署（v5.3） |
 | **9. 交互式申请通配符证书** | 引导式填写基础域名+DNS验证指引，一键申请并部署（v5.3） |
+
+### 4.11 固件下载域名设置与查看（菜单 14）🆕 v8.9
+
+进入后包含两个子菜单：
+
+| 子菜单 | 功能 |
+|-------|------|
+| **1. 设置/修改固件下载域名** | 交互式输入域名，保存后可选重启容器使 `OTA_FIRMWARE_URL_BASE` 生效 |
+| **2. 查看当前固件下载域名** | 显示当前固件域名、固件URL、Nginx配置说明 |
+
+```bash
+# 子菜单1 设置流程
+输入域名 → 保存到 /opt/ota-ql/.firmware_domain → 重启容器(可选)
+# 容器重启后 OTA_FIRMWARE_URL_BASE=https://<域名>/firmware 生效
+
+# 子菜单2 查看显示
+固件域名 + 固件URL + 环境变量 + Nginx反代配置表
+```
+
+> ⚠️ **前置条件**：使用此功能前，必须先在 Nginx 中配置 `/firmware` 反向代理到 `http://127.0.0.1:10089`（详见[第12章](#12-服务器部署及反代设置v89-新增)）。
 
 ---
 
@@ -668,10 +694,11 @@ services:
     container_name: ota-ql
     restart: unless-stopped
     ports:
-      - "10088:10088"
-      - "10086:10086"
-      - "1883:1883"
-      - "8883:8883"
+      - "127.0.0.1:10088:10088"   # Web管理 (Nginx反代)
+      - "127.0.0.1:10089:10089"   # 固件下载 (Nginx /firmware 反代)
+      - "0.0.0.0:10086:10086"     # 设备网关 (直连)
+      - "0.0.0.0:1883:1883"       # MQTT (直连)
+      - "0.0.0.0:8883:8883"       # MQTTS (直连)
     volumes:
       - ./ota-data/firmware:/app/firmware
       - ./ota-data/certs:/app/certs
@@ -679,19 +706,22 @@ services:
       - ./ota-data/data:/app/data
     environment:
       - OTA_LOG_LEVEL=info
+      - OTA_SERVER_ADDR=ota.wisefido.com
+      - OTA_FIRMWARE_URL_BASE=https://ota.wisefido.com/firmware
 ```
 
 ### B. 防火墙配置
 
 ```bash
 # UFW（Ubuntu）
-sudo ufw allow 10088/tcp
-sudo ufw allow 10086/tcp
-sudo ufw allow 1883/tcp
-sudo ufw allow 8883/tcp
+sudo ufw allow 443/tcp     # Nginx HTTPS (Web管理+固件下载)
+sudo ufw allow 10086/tcp   # 设备网关 (直连)
+sudo ufw allow 1883/tcp    # MQTT (直连)
+sudo ufw allow 8883/tcp    # MQTTS (直连)
+# 注意: 10088/10089 不需要开放，已绑定127.0.0.1，通过Nginx反代访问
 
 # firewalld（CentOS）
-sudo firewall-cmd --permanent --add-port=10088/tcp
+sudo firewall-cmd --permanent --add-port=443/tcp
 sudo firewall-cmd --permanent --add-port=10086/tcp
 sudo firewall-cmd --permanent --add-port=1883/tcp
 sudo firewall-cmd --permanent --add-port=8883/tcp
@@ -882,7 +912,244 @@ SSL 证书覆盖检查 (v5.3)
 
 ---
 
+## 12. 服务器部署及反代设置（v8.9 新增）
+
+### 12.1 架构概述
+
+v8.9 起，OTA-QL 采用 **Nginx 反向代理 + Docker 容器** 的生产部署架构。HTTP 管理面板和固件下载服务均绑定 `127.0.0.1`，通过 Nginx 提供对外 HTTPS 访问；设备协议端口（cmux 网关/MQTT/MQTTS）直连公网。
+
+```
+公网用户/ESP32设备
+│
+├── :443    ─── HTTPS ──── Nginx反代 → 127.0.0.1:10088 ── Web管理面板 + REST API
+├── :443/firmware ── HTTPS ── Nginx反代 → 127.0.0.1:10089 ── HTTP固件下载 (ESP32 OTA)
+├── :10086  ─── TCP/TLS ── Docker直连 (0.0.0.0) ────────── 设备接入网关 (cmux)
+├── :1883   ─── MQTT ───── Docker直连 (0.0.0.0) ────────── MQTT Broker (明文)
+└── :8883   ─── MQTTS ──── Docker直连 (0.0.0.0) ────────── MQTTS Broker (TLS)
+```
+
+### 12.2 端口绑定策略
+
+| 端口 | 绑定地址 | 对外可访问 | 访问方式 | 说明 |
+|------|---------|-----------|---------|------|
+| 10088 | 127.0.0.1 | ❌ | Nginx :443 反代 | Web管理面板 + API |
+| 10089 | 127.0.0.1 | ❌ | Nginx :443/firmware 反代 | ESP32 固件下载 |
+| 10086 | 0.0.0.0 | ✅ | 设备直连 | cmux 设备网关 |
+| 1883 | 0.0.0.0 | ✅ | 设备直连 | MQTT Broker |
+| 8883 | 0.0.0.0 | ✅ | 设备直连 | MQTTS Broker |
+
+> 💡 **安全优势**：10088/10089 不暴露到公网，防火墙无需开放这两个端口。
+
+### 12.3 Nginx 反向代理配置
+
+#### 12.3.1 完整 Nginx 配置文件
+
+```nginx
+# /etc/nginx/sites-available/ota-ql
+# 或宝塔面板中对应站点的配置
+
+# ---- HTTPS (443) ----
+server {
+    listen 443 ssl http2;
+    server_name ota.wisefido.com ota.wisefido.work;
+
+    # Let's Encrypt 正式证书
+    ssl_certificate     /etc/letsencrypt/live/ota.wisefido.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ota.wisefido.com/privkey.pem;
+
+    # SSL优化
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+
+    # Web管理面板 + API（反代到Go HTTPS端口）
+    location / {
+        proxy_pass https://127.0.0.1:10088;
+        proxy_ssl_verify off;      # Go使用自签证书，跳过验证
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # WebSocket 支持（日志实时推送等）
+    location /ws {
+        proxy_pass https://127.0.0.1:10088;
+        proxy_ssl_verify off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # 固件下载（v8.9: 反代到HTTP固件端口，大文件优化）
+    location /firmware {
+        proxy_pass http://127.0.0.1:10089;
+        proxy_read_timeout 600s;
+        proxy_buffering off;        # 大文件不缓冲
+    }
+}
+
+# ---- HTTP → HTTPS 重定向 ----
+server {
+    listen 80;
+    server_name ota.wisefido.com ota.wisefido.work;
+    return 301 https://$host$request_uri;
+}
+```
+
+#### 12.3.2 宝塔面板配置方法
+
+如果使用**宝塔面板**管理 Nginx，按以下步骤配置：
+
+**步骤一：Web 管理面板反代（:443 → :10088）**
+
+1. 打开宝塔面板 → 网站 → 选择 `ota.wisefido.com` 站点
+2. 点击 **反向代理** → **添加反向代理**
+3. 配置：
+   - 代理名称：`ota-web`
+   - 目标URL：`https://127.0.0.1:10088`
+   - 发送域名：`$host`
+
+**步骤二：固件下载反代（:443/firmware → :10089）**
+
+1. 在同一站点 → **反向代理** → **添加反向代理**
+2. 配置：
+   - 代理名称：`ota-firmware`
+   - 目标URL：`http://127.0.0.1:10089`
+   - 代理目录：`/firmware`（⚠️ **必须填写**）
+
+> 📌 **验证方法**：浏览器访问 `https://ota.wisefido.com/firmware`，应返回 `{"error":"缺少文件名"}` 或 HTTP 400，表示反代配置成功。
+
+**步骤三：SSL 证书**
+
+1. 在站点设置 → **SSL** → 使用 Let's Encrypt 申请证书
+2. 勾选 `ota.wisefido.com` 和 `ota.wisefido.work`（如需双域名）
+3. 申请成功后自动续期
+
+### 12.4 固件下载域名配置
+
+#### 12.4.1 什么是固件下载域名？
+
+`OTA_FIRMWARE_URL_BASE` 环境变量决定了 OTA 推送消息中固件下载的 URL 前缀。ESP32 设备收到 OTA 升级指令后，会从这个地址下载固件文件。
+
+```
+v8.9 之前:  http://ota.wisefido.com:10089/firmware/xxx.bin  (HTTP直连)
+v8.9 之后:  https://ota.wisefido.com/firmware/xxx.bin        (HTTPS Nginx反代)
+```
+
+#### 12.4.2 部署脚本配置方式
+
+**方式一：部署时自动提示**
+
+执行菜单 1（生产部署）或 13（测试部署）时，脚本会在设置回调地址后提示：
+
+```
+=========================================
+  固件下载域名设置 (v8.9)
+=========================================
+
+什么是固件下载域名？
+  ESP32 设备 OTA 升级时，从此域名下载固件文件。
+  服务器会设置环境变量:
+    OTA_FIRMWARE_URL_BASE=https://<域名>/firmware
+
+  ⚠️  使用此功能前，请确保 Nginx 已配置 /firmware 反代:
+
+  ┌──────────────────────────────────────────────────┐
+  │  Nginx 反向代理配置 (必须先完成)                  │
+  ├──────────────────────────────────────────────────┤
+  │  location /firmware {                             │
+  │      proxy_pass http://127.0.0.1:10089;          │
+  │      proxy_read_timeout 600s;                     │
+  │      proxy_buffering off;                         │
+  │  }                                                │
+  └──────────────────────────────────────────────────┘
+
+请输入固件下载域名: ota.wisefido.com
+[SUCCESS] 固件下载域名已设置: ota.wisefido.com
+```
+
+**方式二：菜单 14 设置与查看**
+
+选择菜单 14 进入子菜单：
+- **子菜单 1**：设置/修改固件下载域名，修改后提示是否重启容器
+- **子菜单 2**：查看当前固件域名及派生的固件 URL、Nginx 配置说明
+
+#### 12.4.3 环境变量传递
+
+```
+.firmware_domain 文件 → 部署脚本读取 → Docker -e OTA_FIRMWARE_URL_BASE=https://<域名>/firmware
+                                                ↓
+                                        Go 服务器 main.go
+                                                ↓
+                                        OTA 推送消息中的 firmwareURL 字段
+                                                ↓
+                                        ESP32 设备从此 URL 下载固件
+```
+
+### 12.5 完整部署检查清单
+
+部署完成后，按以下清单逐项验证：
+
+| # | 检查项 | 验证命令/方法 | 预期结果 |
+|---|-------|-------------|---------|
+| 1 | Docker 容器运行 | `docker ps -f name=ota-ql` | 状态 Up |
+| 2 | Nginx 反代 Web 管理 | 浏览器访问 `https://ota.wisefido.com/` | 显示登录页面 |
+| 3 | Nginx 反代固件下载 | 浏览器访问 `https://ota.wisefido.com/firmware` | 返回 `{"error":"缺少文件名"}` |
+| 4 | 10088 不可公网访问 | `curl -sk https://<公网IP>:10088/` | 连接拒绝 |
+| 5 | 10089 不可公网访问 | `curl http://<公网IP>:10089/` | 连接拒绝 |
+| 6 | cmux 网关直连 | `telnet ota.wisefido.com 10086` | 连接成功 |
+| 7 | MQTT 直连 | `telnet ota.wisefido.com 1883` | 连接成功 |
+| 8 | MQTTS 直连 | `telnet ota.wisefido.com 8883` | 连接成功 |
+| 9 | SSL 证书有效 | `echo | openssl s_client -connect ota.wisefido.com:443 2>/dev/null | openssl x509 -noout -dates` | 证书未过期 |
+| 10 | 固件域名已配置 | 脚本菜单 3 查看部署信息 | 显示固件域名和URL |
+
+### 12.6 防火墙配置（v8.9 更新）
+
+```bash
+# 需要开放的端口（v8.9）
+443/tcp      # Nginx HTTPS（Web管理 + 固件下载）
+10086/tcp    # 设备接入网关 (cmux, 直连)
+1883/tcp     # MQTT Broker (直连)
+8883/tcp     # MQTTS Broker (直连)
+80/tcp       # HTTP → HTTPS 重定向（可选）
+
+# 不需要开放的端口（已绑定127.0.0.1）
+# 10088/tcp  — Web管理（通过Nginx 443反代）
+# 10089/tcp  — 固件下载（通过Nginx 443/firmware反代）
+```
+
+### 12.7 常见问题
+
+#### Q: 为什么 10086/1883/8883 不能用 Nginx 反代？
+
+这些端口使用**非 HTTP 协议**（TCP/MQTT），Nginx `http` 块无法处理。虽然 Nginx `stream` 块可以做四层透传，但 Docker 直接暴露端口更简单可靠，无需额外配置。
+
+#### Q: ESP32 设备能通过 HTTPS 下载固件吗？
+
+可以。v8.9 通过 Nginx `/firmware` 反代实现：
+- ESP32 请求 `https://ota.wisefido.com/firmware/xxx.bin`
+- Nginx 443 接收请求 → 转发到 `http://127.0.0.1:10089/firmware/xxx.bin`
+- Go HTTP 固件服务返回文件
+- Nginx 使用 Let's Encrypt 证书加密传输给 ESP32
+
+#### Q: 宝塔面板中看不到 `/firmware` 反代怎么办？
+
+在宝塔面板 → 网站 → 反向代理中，确保"代理目录"填写了 `/firmware`。如果宝塔版本较旧不支持路径代理，可手动编辑 Nginx 配置文件，在 `server` 块中添加 `location /firmware` 块。
+
+#### Q: 从旧版本升级到 v8.9 需要做什么？
+
+1. 更新部署脚本（wget 最新版本）
+2. 运行脚本菜单 1 重新部署
+3. 脚本会自动提示配置固件下载域名
+4. **手动配置 Nginx `/firmware` 反代**（脚本会提示 Nginx 配置方法）
+5. 防火墙**关闭** 10089 端口（不再需要）
+
+---
+
 > ⚡ **版本历史**:
+> **v8.9** (2026-03-08) — 新增第12章"服务器部署及反代设置"；固件下载(10089)改为127.0.0.1绑定+Nginx /firmware反代；新增菜单14固件下载域名管理；OTA_FIRMWARE_URL_BASE环境变量；端口表/防火墙/Docker Compose全面更新
 > **v5.3** (2026-03-08) — SSL证书管理菜单扩展至9项（新增覆盖检查/交互式SAN/交互式通配符），部署菜单扩展至7项，新增跨域名证书部署详解（6.8章节）
 > **v5.2** (2026-03-08) — 部署时SSL证书配置改为交互式菜单（搜索已有/通配符/SAN多域名），新增多域名证书申请指导
 > **v5.1** (2026-03-08) — 修复证书搜索重复误报BUG（realpath去重），新增跨域名证书部署（菜单11→子菜单6）
