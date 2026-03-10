@@ -319,11 +319,13 @@ start_new_container() {
         ENV_ARGS="-e OTA_SERVER_ADDR=${SERVER_ADDR}"
     fi
 
-    # v8.9: 固件下载域名 → OTA_FIRMWARE_URL_BASE 环境变量
+    # v8.9+v11.1: 固件下载域名 → 双协议环境变量（TCP设备走HTTP, MQTT设备走HTTPS）
     local FW_DOMAIN=$(get_firmware_domain)
     if [ -n "${FW_DOMAIN}" ]; then
         ENV_ARGS="${ENV_ARGS} -e OTA_FIRMWARE_URL_BASE=https://${FW_DOMAIN}/firmware"
-        log_success "固件下载URL: https://${FW_DOMAIN}/firmware (走Nginx HTTPS反代)"
+        ENV_ARGS="${ENV_ARGS} -e OTA_FIRMWARE_URL_BASE_HTTP=http://${FW_DOMAIN}/firmware"
+        log_success "固件下载URL(MQTT设备): https://${FW_DOMAIN}/firmware (Nginx HTTPS反代)"
+        log_success "固件下载URL(TCP设备):  http://${FW_DOMAIN}/firmware (Nginx HTTP反代)"
     else
         log_warning "未配置固件下载域名，设备将使用 http://<回调地址>:${HTTP_FW_PORT}/firmware"
         log_warning "建议通过菜单 [14] 设置固件下载域名，通过Nginx反代提升下载稳定性"
@@ -812,10 +814,12 @@ show_firmware_domain() {
 
     if [ -n "${FW_DOMAIN}" ]; then
         echo -e "  ${GREEN}✓${NC} 固件下载域名:  ${FW_DOMAIN}"
-        echo -e "  ${GREEN}✓${NC} 固件下载URL:   https://${FW_DOMAIN}/firmware"
+        echo -e "  ${GREEN}✓${NC} MQTT设备URL:   https://${FW_DOMAIN}/firmware"
+        echo -e "  ${GREEN}✓${NC} TCP设备URL:    http://${FW_DOMAIN}/firmware"
         echo ""
         echo "  存储位置: ${FIRMWARE_DOMAIN_FILE}"
         echo "  环境变量: OTA_FIRMWARE_URL_BASE=https://${FW_DOMAIN}/firmware"
+        echo "  环境变量: OTA_FIRMWARE_URL_BASE_HTTP=http://${FW_DOMAIN}/firmware"
         echo ""
         echo "  Nginx反向代理配置（必须已添加）:"
         echo "  ┌──────────┬───────────────────────────────────┬──────────┐"
@@ -2746,8 +2750,10 @@ show_production_deploy_success() {
     echo "[固件下载域名]"
     if [ -n "$FW_DOMAIN_PROD" ]; then
         echo -e "  ${GREEN}✓${NC} 固件域名:   ${FW_DOMAIN_PROD}"
-        echo -e "  ${GREEN}✓${NC} 固件URL:    https://${FW_DOMAIN_PROD}/firmware"
+        echo -e "  ${GREEN}✓${NC} MQTT设备:   https://${FW_DOMAIN_PROD}/firmware"
+        echo -e "  ${GREEN}✓${NC} TCP设备:    http://${FW_DOMAIN_PROD}/firmware"
         echo "  环境变量:    OTA_FIRMWARE_URL_BASE=https://${FW_DOMAIN_PROD}/firmware"
+        echo "  环境变量:    OTA_FIRMWARE_URL_BASE_HTTP=http://${FW_DOMAIN_PROD}/firmware"
         echo "  Nginx反代:   /firmware → 127.0.0.1:${HTTP_FW_PORT}"
     else
         echo -e "  ${YELLOW}!${NC} 未配置固件下载域名"
@@ -3448,8 +3454,10 @@ show_deployment_info() {
     echo "[固件下载域名]"
     if [ -n "$FW_DOMAIN_INFO" ]; then
         echo -e "  ${GREEN}✓${NC} 固件域名:   ${FW_DOMAIN_INFO}"
-        echo -e "  ${GREEN}✓${NC} 固件URL:    https://${FW_DOMAIN_INFO}/firmware"
+        echo -e "  ${GREEN}✓${NC} MQTT设备:   https://${FW_DOMAIN_INFO}/firmware"
+        echo -e "  ${GREEN}✓${NC} TCP设备:    http://${FW_DOMAIN_INFO}/firmware"
         echo "  环境变量:    OTA_FIRMWARE_URL_BASE=https://${FW_DOMAIN_INFO}/firmware"
+        echo "  环境变量:    OTA_FIRMWARE_URL_BASE_HTTP=http://${FW_DOMAIN_INFO}/firmware"
         echo "  Nginx反代:   /firmware → 127.0.0.1:${HTTP_FW_PORT}"
     else
         echo -e "  ${YELLOW}!${NC} 未配置固件下载域名，请菜单 14 设置"
