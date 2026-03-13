@@ -279,7 +279,7 @@ check_port_conflicts() {
         echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '10088|10089|10086|1883|8883'"
         echo "  3. 或修改本脚本中的端口变量后重试"
         echo ""
-        read -p "是否强制继续部署？(可能失败) [y/N]: " FORCE
+        read -ep "是否强制继续部署？(可能失败) [y/N]: " FORCE
         if [[ ! "$FORCE" =~ ^[Yy]$ ]]; then
             log_info "部署已取消，请先释放端口后重试"
             return 1
@@ -590,6 +590,7 @@ save_reverse_proxy_mode() {
 }
 
 # 交互式选择反向代理模式（部署时调用）
+# 选"使用反向代理"时，弹出 Range 头配置说明和菜单
 prompt_reverse_proxy_mode() {
     local CURRENT_MODE=$(get_reverse_proxy_mode)
 
@@ -600,12 +601,12 @@ prompt_reverse_proxy_mode() {
     echo ""
     echo "固件下载端口(${HTTP_FW_PORT})的网络访问方式:"
     echo ""
-    echo -e "  ${GREEN}1. 使用反向代理（推荐/默认）${NC}"
+    echo -e "  ${GREEN}[Y] 使用反向代理（推荐/默认）${NC}"
     echo "     HTTP固件端口绑定 127.0.0.1，仅 Nginx 可访问"
     echo "     设备通过 Nginx 反代下载固件（HTTPS + 域名）"
     echo "     适用: 已配置 Nginx/宝塔反向代理的服务器"
     echo ""
-    echo -e "  ${YELLOW}2. 不使用反向代理${NC}"
+    echo -e "  ${YELLOW}[n] 不使用反向代理${NC}"
     echo "     HTTP固件端口绑定 0.0.0.0，设备直接访问"
     echo "     设备通过 http://服务器IP:${HTTP_FW_PORT}/firmware 下载"
     echo "     适用: 测试环境 / 内网 / 无Nginx的服务器"
@@ -618,13 +619,53 @@ prompt_reverse_proxy_mode() {
     fi
     echo ""
 
-    read -p "是否使用反向代理? [Y/n] (默认Y): " choice
+    read -ep "是否使用反向代理? [Y/n] (默认Y): " choice
     if [[ "$choice" =~ ^[Nn]$ ]]; then
         save_reverse_proxy_mode "no"
         log_info "已选择: 不使用反向代理 (HTTP固件端口将绑定 0.0.0.0)"
+        return 0
+    fi
+
+    # ── 使用反向代理：弹出 Range 头说明 + 配置菜单 ──────────────────────────
+    save_reverse_proxy_mode "yes"
+    log_info "已选择: 使用反向代理 (HTTP固件端口绑定 127.0.0.1)"
+
+    echo ""
+    echo "========================================="
+    echo -e "  ${CYAN}⚡ 关于 Nginx Range 头与 OTA 进度条${NC}"
+    echo "========================================="
+    echo ""
+    echo -e "  ${CYAN}问题：${NC}使用 Nginx 反向代理时，Nginx 默认会剥离 ESP32 发送的"
+    echo "  Range 头（bytes=N-M），导致 Go 服务端无法实时追踪下载进度。"
+    echo ""
+    echo "  📊 两种效果对比:"
+    echo ""
+    echo -e "  ${YELLOW}❌ 未配置 Range 透传（Nginx 默认行为）:${NC}"
+    echo "     P1进度条: 0% ─────────────────────────→ 100%  (直接跳变)"
+    echo "     ESP32共发出 268 个 Range 请求，Go 只收到 1 次整体请求"
+    echo "     进度追踪: Safety Net 估算（downloading → 完成 瞬间跳变）"
+    echo ""
+    echo -e "  ${GREEN}✅ 配置 Range 透传后（推荐）:${NC}"
+    echo "     P1进度条: 0→1→2→3→...→99→100%  (实时平滑递增)"
+    echo "     每个 Range 请求都到达 Go → Write() 逐块实时更新进度"
+    echo "     与本地直连服务器效果完全一致"
+    echo ""
+    echo "  🔧 方案：在 Nginx /firmware location 块内添加 4 行配置:"
+    echo ""
+    echo -e "  ${GREEN}    proxy_set_header Range \$http_range;${NC}"
+    echo -e "  ${GREEN}    proxy_set_header If-Range \$http_if_range;${NC}"
+    echo -e "  ${GREEN}    proxy_buffering off;${NC}"
+    echo -e "  ${GREEN}    proxy_cache off;${NC}"
+    echo ""
+    echo "  ⚠️  注意: proxy_buffering off 会禁用 Nginx 对该路径的缓冲，"
+    echo "     每次 Range 请求均实时转发到 Go——少量设备并发时影响可忽略。"
+    echo ""
+    read -ep "  是否现在配置 Nginx Range 头透传? [Y/n]: " range_now
+    if [[ ! "$range_now" =~ ^[Nn]$ ]]; then
+        menu_nginx_range
     else
-        save_reverse_proxy_mode "yes"
-        log_info "已选择: 使用反向代理 (HTTP固件端口绑定 127.0.0.1)"
+        echo ""
+        log_info "已跳过，部署完成后可通过菜单 [15] 配置 Nginx Range 头透传"
     fi
 }
 
@@ -677,7 +718,7 @@ auto_configure_nginx_range() {
     echo -e "  ${CYAN}检测到 Nginx /firmware 反代尚未配置 Range 头透传${NC}"
     echo "  配置 Range 头透传可实现 OTA 进度 0%→100% 实时追踪"
     echo ""
-    read -p "  是否自动配置 Nginx Range 头透传? [Y/n]: " confirm
+    read -ep "  是否自动配置 Nginx Range 头透传? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
         log_info "跳过 Range 头配置，进度将通过 Safety Net 估算"
         return 0
@@ -756,14 +797,14 @@ prompt_mqtt_addr() {
 
     if [ -n "${CURRENT_ADDR}" ]; then
         log_info "当前MQTT服务器地址: ${CURRENT_ADDR}"
-        read -p "输入新地址 (回车保留当前值): " NEW_ADDR
+        read -ep "输入新地址 (回车保留当前值): " NEW_ADDR
         if [ -z "${NEW_ADDR}" ]; then
             NEW_ADDR="${CURRENT_ADDR}"
             log_info "保留当前地址: ${NEW_ADDR}"
         fi
     else
         log_warning "尚未配置MQTT服务器地址"
-        read -p "请输入MQTT服务器地址 (域名或IP): " NEW_ADDR
+        read -ep "请输入MQTT服务器地址 (域名或IP): " NEW_ADDR
         if [ -z "${NEW_ADDR}" ]; then
             log_warning "未输入地址，将使用服务器自动检测IP"
             return 0
@@ -830,7 +871,7 @@ set_mqtt_addr_with_restart() {
     if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
         echo ""
         log_warning "MQTT服务器地址是容器启动时的环境变量，修改后需要重启容器才能生效"
-        read -p "是否立即重启容器？[Y/n]: " RESTART
+        read -ep "是否立即重启容器？[Y/n]: " RESTART
         if [[ ! "$RESTART" =~ ^[Nn]$ ]]; then
             log_info "正在重启容器..."
             docker stop ${CONTAINER_NAME} > /dev/null 2>&1
@@ -869,7 +910,7 @@ menu_set_mqtt_addr() {
     echo "  2. 查看当前MQTT服务器地址"
     echo "  0. 返回主菜单"
     echo ""
-    read -p "请选择 [0-2]: " sub_choice
+    read -ep "请选择 [0-2]: " sub_choice
 
     case $sub_choice in
         1)
@@ -937,7 +978,7 @@ prompt_firmware_domain() {
     if [ -n "${CURRENT_DOMAIN}" ]; then
         log_info "当前固件下载域名: ${CURRENT_DOMAIN}"
         log_info "固件下载URL: https://${CURRENT_DOMAIN}/firmware"
-        read -p "输入新域名 (回车保留当前值): " NEW_DOMAIN
+        read -ep "输入新域名 (回车保留当前值): " NEW_DOMAIN
         if [ -z "${NEW_DOMAIN}" ]; then
             NEW_DOMAIN="${CURRENT_DOMAIN}"
             log_info "保留当前域名: ${NEW_DOMAIN}"
@@ -945,7 +986,7 @@ prompt_firmware_domain() {
     else
         log_warning "尚未配置固件下载域名"
         echo -e "  推荐填写: ${GREEN}ota.wisefido.work${NC}"
-        read -p "请输入固件下载域名: " NEW_DOMAIN
+        read -ep "请输入固件下载域名: " NEW_DOMAIN
         if [ -z "${NEW_DOMAIN}" ]; then
             log_warning "未输入域名，设备将使用HTTP直连下载固件（大文件可能超时）"
             return 0
@@ -1007,7 +1048,7 @@ set_firmware_domain_with_restart() {
     if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
         echo ""
         log_warning "固件下载域名是容器启动时的环境变量，修改后需要重启容器才能生效"
-        read -p "是否立即重启容器？[Y/n]: " RESTART
+        read -ep "是否立即重启容器？[Y/n]: " RESTART
         if [[ ! "$RESTART" =~ ^[Nn]$ ]]; then
             log_info "正在重启容器..."
             docker stop ${CONTAINER_NAME} > /dev/null 2>&1
@@ -1051,7 +1092,7 @@ menu_firmware_domain() {
     echo "  2. 查看当前固件下载域名"
     echo "  0. 返回主菜单"
     echo ""
-    read -p "请选择 [0-2]: " sub_choice
+    read -ep "请选择 [0-2]: " sub_choice
 
     case $sub_choice in
         1)
@@ -1073,31 +1114,120 @@ menu_firmware_domain() {
 # Nginx 固件下载 Range 头配置管理（v9.0 新增）
 # ============================================================================
 
-# 查找 Nginx 配置文件
+# 全局变量: 交互式 resolve 后存储结果（避免子 shell 吞掉交互输出）
+_NGINX_CONF_PATH=""
+
+# 非交互式自动查找 Nginx 配置文件（用于状态显示等场景）
+# 优先级: 按域名固定路径 → 搜索含 /firmware 的 .conf 文件
 find_nginx_conf() {
     local FW_DOMAIN=$(get_firmware_domain)
-    if [ -z "$FW_DOMAIN" ]; then
-        echo ""
-        return 1
+
+    # 1. 按域名固定路径查找
+    if [ -n "$FW_DOMAIN" ]; then
+        local FIXED_PATHS=(
+            "/www/server/panel/vhost/nginx/${FW_DOMAIN}.conf"
+            "/etc/nginx/conf.d/${FW_DOMAIN}.conf"
+            "/etc/nginx/sites-available/${FW_DOMAIN}"
+            "/etc/nginx/sites-enabled/${FW_DOMAIN}"
+            "/opt/1panel/core/apps/openresty/openresty/conf.d/${FW_DOMAIN}.conf"
+        )
+        for path in "${FIXED_PATHS[@]}"; do
+            if [ -f "$path" ]; then
+                echo "$path"
+                return 0
+            fi
+        done
     fi
 
-    local SEARCH_PATHS=(
-        "/www/server/panel/vhost/nginx/${FW_DOMAIN}.conf"
-        "/etc/nginx/conf.d/${FW_DOMAIN}.conf"
-        "/etc/nginx/sites-available/${FW_DOMAIN}"
-        "/etc/nginx/sites-enabled/${FW_DOMAIN}"
-        "/opt/1panel/core/apps/openresty/openresty/conf.d/${FW_DOMAIN}.conf"
+    # 2. 搜索常见目录中含 /firmware 的 .conf 文件（不交互）
+    local SEARCH_DIRS=(
+        "/www/server/panel/vhost/nginx"
+        "/etc/nginx/conf.d"
+        "/etc/nginx/sites-enabled"
+        "/opt/1panel/core/apps/openresty/openresty/conf.d"
     )
-
-    for path in "${SEARCH_PATHS[@]}"; do
-        if [ -f "$path" ]; then
-            echo "$path"
+    for dir in "${SEARCH_DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        local found
+        found=$(grep -rl "firmware" "$dir" --include="*.conf" 2>/dev/null | head -1)
+        if [ -n "$found" ]; then
+            echo "$found"
             return 0
         fi
     done
 
     echo ""
     return 1
+}
+
+# 交互式解析 Nginx 配置文件路径
+# 优先级: 自动匹配 → find搜索 → 用户列表选择 → 手动输入
+# 结果存入全局变量 _NGINX_CONF_PATH（不通过 stdout 返回，避免子 shell 问题）
+resolve_nginx_conf_interactive() {
+    _NGINX_CONF_PATH=""
+
+    # 1. 先尝试非交互自动找
+    local AUTO_CONF
+    AUTO_CONF=$(find_nginx_conf)
+    if [ -n "$AUTO_CONF" ]; then
+        log_success "已自动找到 Nginx 配置: $AUTO_CONF"
+        _NGINX_CONF_PATH="$AUTO_CONF"
+        return 0
+    fi
+
+    # 2. 在常见 Nginx 目录中搜索所有 .conf 文件
+    log_info "自动搜索 Nginx 配置文件中..."
+    local SEARCH_DIRS=(
+        "/www/server/panel/vhost/nginx"
+        "/etc/nginx/conf.d"
+        "/etc/nginx/sites-available"
+        "/etc/nginx/sites-enabled"
+        "/opt/1panel/core/apps/openresty/openresty/conf.d"
+    )
+    local FOUND_FILES=()
+    for dir in "${SEARCH_DIRS[@]}"; do
+        [ -d "$dir" ] || continue
+        while IFS= read -r f; do
+            FOUND_FILES+=("$f")
+        done < <(find "$dir" -maxdepth 1 -name "*.conf" -type f 2>/dev/null | sort)
+    done
+
+    if [ ${#FOUND_FILES[@]} -gt 0 ]; then
+        echo ""
+        echo -e "  搜索到以下 Nginx 配置文件，请选择含 ${CYAN}/firmware${NC} 反代配置的文件:"
+        echo ""
+        for i in "${!FOUND_FILES[@]}"; do
+            local tag=""
+            grep -q "firmware" "${FOUND_FILES[$i]}" 2>/dev/null && tag="${GREEN} ← 含 /firmware${NC}"
+            echo -e "    [$((i+1))] ${FOUND_FILES[$i]}${tag}"
+        done
+    else
+        log_warning "在常见目录未搜索到 Nginx .conf 文件"
+    fi
+    echo "    [0] 手动输入完整路径"
+    echo ""
+
+    local max_sel=${#FOUND_FILES[@]}
+    read -ep "  请选择 [0-${max_sel}]: " sel
+
+    if [ "$sel" = "0" ] || [ ${#FOUND_FILES[@]} -eq 0 ]; then
+        read -ep "  请输入 Nginx 配置文件完整路径: " manual_path
+        if [ -f "$manual_path" ]; then
+            _NGINX_CONF_PATH="$manual_path"
+            log_success "使用配置文件: $manual_path"
+            return 0
+        else
+            log_error "文件不存在: $manual_path"
+            return 1
+        fi
+    elif [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$max_sel" ]; then
+        _NGINX_CONF_PATH="${FOUND_FILES[$((sel-1))]}"
+        log_success "已选择: $_NGINX_CONF_PATH"
+        return 0
+    else
+        log_warning "无效选择"
+        return 1
+    fi
 }
 
 # 配置 Nginx Range 头透传
@@ -1113,17 +1243,10 @@ configure_nginx_range_header() {
         return 1
     fi
 
-    local NGINX_CONF=$(find_nginx_conf)
-    if [ -z "$NGINX_CONF" ]; then
-        log_warning "未自动找到 Nginx 配置文件"
-        read -p "请手动输入 Nginx 配置文件路径: " NGINX_CONF
-        if [ ! -f "$NGINX_CONF" ]; then
-            log_error "文件不存在: $NGINX_CONF"
-            return 1
-        fi
-    else
-        log_success "找到 Nginx 配置: $NGINX_CONF"
+    if ! resolve_nginx_conf_interactive; then
+        return 1
     fi
+    local NGINX_CONF="$_NGINX_CONF_PATH"
 
     # 检查是否已配置
     if grep -q "proxy_set_header Range" "$NGINX_CONF"; then
@@ -1150,7 +1273,7 @@ configure_nginx_range_header() {
     echo "    proxy_cache off;"
     echo ""
 
-    read -p "确认修改？(修改前会自动备份) [y/N]: " confirm
+    read -ep "确认修改？(修改前会自动备份) [y/N]: " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "已取消"
         return 0
@@ -1183,15 +1306,10 @@ configure_nginx_range_header() {
 
 # 查看 Nginx /firmware 配置
 show_nginx_firmware_config() {
-    local NGINX_CONF=$(find_nginx_conf)
-    if [ -z "$NGINX_CONF" ]; then
-        log_warning "未找到 Nginx 配置文件"
-        local FW_DOMAIN=$(get_firmware_domain)
-        if [ -z "$FW_DOMAIN" ]; then
-            log_error "未配置固件下载域名，请先使用菜单 [14] 设置"
-        fi
+    if ! resolve_nginx_conf_interactive; then
         return 1
     fi
+    local NGINX_CONF="$_NGINX_CONF_PATH"
 
     echo ""
     echo "===== Nginx 配置文件: $NGINX_CONF ====="
@@ -1211,11 +1329,10 @@ show_nginx_firmware_config() {
 
 # 移除 Range 头透传配置
 remove_nginx_range_config() {
-    local NGINX_CONF=$(find_nginx_conf)
-    if [ -z "$NGINX_CONF" ]; then
-        log_warning "未找到 Nginx 配置文件"
+    if ! resolve_nginx_conf_interactive; then
         return 1
     fi
+    local NGINX_CONF="$_NGINX_CONF_PATH"
 
     if ! grep -q "proxy_set_header Range" "$NGINX_CONF"; then
         log_info "当前未配置 Range 头透传，无需恢复"
@@ -1226,7 +1343,7 @@ remove_nginx_range_config() {
     log_warning "将移除 Nginx Range 头透传配置"
     echo "  效果: OTA 进度将通过 Safety Net 估算（0%→100% 跳变）"
     echo ""
-    read -p "确认移除? [y/N]: " confirm
+    read -ep "确认移除? [y/N]: " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "已取消"
         return 0
@@ -1341,7 +1458,7 @@ menu_nginx_range() {
     echo "  5. 恢复默认（移除 Range 头透传）"
     echo "  0. 返回主菜单"
     echo ""
-    read -p "请选择 [0-5]: " sub_choice
+    read -ep "请选择 [0-5]: " sub_choice
 
     case $sub_choice in
         1) configure_nginx_range_header ;;
@@ -1615,7 +1732,7 @@ auto_detect_and_deploy_certs() {
         fi
         echo ""
 
-        read -p "是否重新搜索并替换证书? [y/N]: " replace_confirm
+        read -ep "是否重新搜索并替换证书? [y/N]: " replace_confirm
         if [[ ! "$replace_confirm" =~ ^[Yy]$ ]]; then
             log_info "保留现有证书"
             return 0
@@ -1630,9 +1747,9 @@ auto_detect_and_deploy_certs() {
         echo "  SSL证书需要域名才能搜索"
         echo "  如需手动配置，请使用菜单中的 [证书管理] 功能"
         echo ""
-        read -p "是否手动输入域名? [y/N]: " manual_confirm
+        read -ep "是否手动输入域名? [y/N]: " manual_confirm
         if [[ "$manual_confirm" =~ ^[Yy]$ ]]; then
-            read -p "请输入域名 (多个用空格分隔): " manual_domains
+            read -ep "请输入域名 (多个用空格分隔): " manual_domains
             domains="$manual_domains"
         fi
         if [ -z "$domains" ]; then
@@ -1674,7 +1791,7 @@ auto_detect_and_deploy_certs() {
         echo -e "  ${YELLOW}提示: 没有CA证书时，Go服务器将使用自签名证书${NC}"
         echo -e "  ${YELLOW}      ESP32设备可能无法通过TLS证书验证${NC}"
         echo ""
-        read -p "按Enter键继续部署..." dummy
+        read -ep "按Enter键继续部署..." dummy
         return 0
     fi
 
@@ -1687,7 +1804,7 @@ auto_detect_and_deploy_certs() {
         local key_path=$(echo "$entry" | cut -d'|' -f4)
 
         echo ""
-        read -p "是否使用此证书? [Y/n]: " use_confirm
+        read -ep "是否使用此证书? [Y/n]: " use_confirm
         if [[ "$use_confirm" =~ ^[Nn]$ ]]; then
             log_info "跳过证书部署"
             return 0
@@ -1712,7 +1829,7 @@ auto_detect_and_deploy_certs() {
     done
     echo "  [0] 跳过，不部署证书"
     echo ""
-    read -p "请选择 [0-${idx}]: " cert_choice
+    read -ep "请选择 [0-${idx}]: " cert_choice
 
     if [ "$cert_choice" = "0" ] || [ -z "$cert_choice" ]; then
         log_info "跳过证书部署"
@@ -1828,13 +1945,13 @@ manual_deploy_cert() {
     echo "请提供证书和私钥文件的完整路径"
     echo ""
 
-    read -p "证书文件路径 (fullchain.pem): " manual_cert
+    read -ep "证书文件路径 (fullchain.pem): " manual_cert
     if [ -z "$manual_cert" ] || [ ! -f "$manual_cert" ]; then
         log_error "证书文件不存在: $manual_cert"
         return 1
     fi
 
-    read -p "私钥文件路径 (privkey.pem): " manual_key
+    read -ep "私钥文件路径 (privkey.pem): " manual_key
     if [ -z "$manual_key" ] || [ ! -f "$manual_key" ]; then
         log_error "私钥文件不存在: $manual_key"
         return 1
@@ -1845,7 +1962,7 @@ manual_deploy_cert() {
     if [ $? -eq 0 ]; then
         echo ""
         echo -e "${YELLOW}提示: 证书已部署，需要重启容器生效${NC}"
-        read -p "是否立即重启容器? [Y/n]: " restart_confirm
+        read -ep "是否立即重启容器? [Y/n]: " restart_confirm
         if [[ ! "$restart_confirm" =~ ^[Nn]$ ]]; then
             docker restart ${CONTAINER_NAME} > /dev/null 2>&1
             sleep 3
@@ -1957,7 +2074,7 @@ search_all_certs() {
     echo "  输入编号 [1-${total_found}] 部署指定证书到 OTA-QL"
     echo "  输入 0 返回"
     echo ""
-    read -p "请选择: " deploy_choice
+    read -ep "请选择: " deploy_choice
 
     if [ "$deploy_choice" = "0" ] || [ -z "$deploy_choice" ]; then
         return 0
@@ -1974,7 +2091,7 @@ search_all_certs() {
         if [ $? -eq 0 ]; then
             echo ""
             echo -e "${YELLOW}提示: 证书已部署，需要重启容器生效${NC}"
-            read -p "是否立即重启容器? [Y/n]: " restart_confirm
+            read -ep "是否立即重启容器? [Y/n]: " restart_confirm
             if [[ ! "$restart_confirm" =~ ^[Nn]$ ]]; then
                 docker restart ${CONTAINER_NAME} > /dev/null 2>&1
                 sleep 3
@@ -2171,7 +2288,7 @@ deploy_cert_cross_domain() {
     echo "  输入编号 [1-${total_found}] 选择证书"
     echo "  输入 0 返回"
     echo ""
-    read -p "请选择: " choice
+    read -ep "请选择: " choice
 
     if [ "$choice" = "0" ] || [ -z "$choice" ]; then
         return 0
@@ -2276,7 +2393,7 @@ deploy_cert_cross_domain() {
     echo ""
 
     # 确认部署
-    read -p "是否将此证书部署到 OTA-QL? [Y/n]: " deploy_confirm
+    read -ep "是否将此证书部署到 OTA-QL? [Y/n]: " deploy_confirm
     if [[ "$deploy_confirm" =~ ^[Nn]$ ]]; then
         log_info "已取消部署"
         return 0
@@ -2287,7 +2404,7 @@ deploy_cert_cross_domain() {
     if [ $? -eq 0 ]; then
         echo ""
         echo -e "${YELLOW}提示: 证书已部署，需要重启容器生效${NC}"
-        read -p "是否立即重启容器? [Y/n]: " restart_confirm
+        read -ep "是否立即重启容器? [Y/n]: " restart_confirm
         if [[ ! "$restart_confirm" =~ ^[Nn]$ ]]; then
             docker restart ${CONTAINER_NAME} > /dev/null 2>&1
             sleep 3
@@ -2333,7 +2450,7 @@ menu_cert_management() {
     echo "  9. 交互式申请通配符证书"
     echo "  0. 返回主菜单"
     echo ""
-    read -p "请选择 [0-9]: " cert_choice
+    read -ep "请选择 [0-9]: " cert_choice
 
     case $cert_choice in
         1)
@@ -2342,7 +2459,7 @@ menu_cert_management() {
         2)
             local domains=$(get_domains_for_cert)
             if [ -z "$domains" ]; then
-                read -p "请输入域名 (多个用空格分隔): " domains
+                read -ep "请输入域名 (多个用空格分隔): " domains
             fi
             if [ -n "$domains" ]; then
                 for domain in $domains; do
@@ -2361,7 +2478,7 @@ menu_cert_management() {
                     done
                     echo "  [0] 取消"
                     echo ""
-                    read -p "请选择 [0-${idx}]: " sel
+                    read -ep "请选择 [0-${idx}]: " sel
 
                     if [ "$sel" -ge 1 ] 2>/dev/null && [ "$sel" -le $idx ] 2>/dev/null; then
                         local chosen="${FOUND_CERTS[$((sel-1))]}"
@@ -2373,7 +2490,7 @@ menu_cert_management() {
 
                         if [ $? -eq 0 ]; then
                             echo ""
-                            read -p "是否立即重启容器生效? [Y/n]: " restart_confirm
+                            read -ep "是否立即重启容器生效? [Y/n]: " restart_confirm
                             if [[ ! "$restart_confirm" =~ ^[Nn]$ ]]; then
                                 docker restart ${CONTAINER_NAME} > /dev/null 2>&1
                                 sleep 3
@@ -2649,7 +2766,7 @@ apply_wildcard_cert() {
         echo ""
     fi
 
-    read -p "请输入基础域名 (如 wisefido.com): " input_domain
+    read -ep "请输入基础域名 (如 wisefido.com): " input_domain
     if [ -z "$input_domain" ] && [ -n "$base_domain" ]; then
         input_domain="$base_domain"
         echo "  使用推测域名: $input_domain"
@@ -2666,7 +2783,7 @@ apply_wildcard_cert() {
     echo -e "${YELLOW}注意: certbot 会要求你在域名管理面板添加 TXT 记录${NC}"
     echo -e "${YELLOW}      请在另一个终端或浏览器中完成 DNS 验证${NC}"
     echo ""
-    read -p "是否继续? [Y/n]: " proceed
+    read -ep "是否继续? [Y/n]: " proceed
     if [[ "$proceed" =~ ^[Nn]$ ]]; then
         return 1
     fi
@@ -2709,7 +2826,7 @@ apply_wildcard_cert() {
             fi
 
             echo ""
-            read -p "是否部署此证书到 OTA-QL? [Y/n]: " deploy_confirm
+            read -ep "是否部署此证书到 OTA-QL? [Y/n]: " deploy_confirm
             if [[ ! "$deploy_confirm" =~ ^[Nn]$ ]]; then
                 deploy_cert_to_ota "$cert_path" "$key_path" "通配符证书 (*.${input_domain})"
                 return $?
@@ -2754,7 +2871,7 @@ apply_san_cert() {
     echo "请输入要包含的域名（空格分隔，至少2个）"
     echo -e "  示例: ${CYAN}ota.wisefido.com ota.wisefido.work${NC}"
     echo ""
-    read -p "域名列表: " domain_list
+    read -ep "域名列表: " domain_list
 
     if [ -z "$domain_list" ]; then
         log_warning "未输入域名，取消操作"
@@ -2784,7 +2901,7 @@ apply_san_cert() {
     echo "  2. DNS 验证（--manual --preferred-challenges dns，需手动添加TXT记录）"
     echo "  3. Nginx 插件（--nginx，需已安装 certbot-nginx）"
     echo ""
-    read -p "请选择 [1-3]: " verify_method
+    read -ep "请选择 [1-3]: " verify_method
 
     local verify_args=""
     case $verify_method in
@@ -2811,7 +2928,7 @@ apply_san_cert() {
     echo -e "${BOLD}即将执行:${NC}"
     echo -e "  ${CYAN}sudo certbot certonly ${verify_args}${certbot_args}${NC}"
     echo ""
-    read -p "是否继续? [Y/n]: " proceed
+    read -ep "是否继续? [Y/n]: " proceed
     if [[ "$proceed" =~ ^[Nn]$ ]]; then
         return 1
     fi
@@ -2850,7 +2967,7 @@ apply_san_cert() {
             fi
 
             echo ""
-            read -p "是否部署此证书到 OTA-QL? [Y/n]: " deploy_confirm
+            read -ep "是否部署此证书到 OTA-QL? [Y/n]: " deploy_confirm
             if [[ ! "$deploy_confirm" =~ ^[Nn]$ ]]; then
                 deploy_cert_to_ota "$cert_path" "$key_path" "SAN多域名证书 (${domain_list})"
                 return $?
@@ -2895,7 +3012,7 @@ deploy_cert_interactive_menu() {
             echo -e "  到期: ${existing_expiry}"
         fi
         echo ""
-        read -p "是否重新配置证书? [y/N]: " reconfig
+        read -ep "是否重新配置证书? [y/N]: " reconfig
         if [[ ! "$reconfig" =~ ^[Yy]$ ]]; then
             log_info "保留现有证书，继续部署"
             return 0
@@ -2913,7 +3030,7 @@ deploy_cert_interactive_menu() {
     echo "  6. 交互式申请通配符证书（引导式填写域名+DNS验证指引）"
     echo "  0. 跳过（使用自签名证书，ESP32设备可能无法连接）"
     echo ""
-    read -p "请选择 [0-6]: " cert_menu_choice
+    read -ep "请选择 [0-6]: " cert_menu_choice
 
     case $cert_menu_choice in
         1)
@@ -2929,7 +3046,7 @@ deploy_cert_interactive_menu() {
                 echo "  3. 申请 SAN 多域名证书"
                 echo "  0. 跳过"
                 echo ""
-                read -p "请选择 [0/2/3]: " retry_choice
+                read -ep "请选择 [0/2/3]: " retry_choice
                 case $retry_choice in
                     2) apply_wildcard_cert ;;
                     3) apply_san_cert ;;
@@ -2947,7 +3064,7 @@ deploy_cert_interactive_menu() {
                 echo "  3. 申请 SAN 多域名证书"
                 echo "  0. 跳过"
                 echo ""
-                read -p "请选择 [0/1/3]: " retry_choice
+                read -ep "请选择 [0/1/3]: " retry_choice
                 case $retry_choice in
                     1) auto_detect_and_deploy_certs ;;
                     3) apply_san_cert ;;
@@ -2965,7 +3082,7 @@ deploy_cert_interactive_menu() {
                 echo "  2. 申请通配符证书"
                 echo "  0. 跳过"
                 echo ""
-                read -p "请选择 [0/1/2]: " retry_choice
+                read -ep "请选择 [0/1/2]: " retry_choice
                 case $retry_choice in
                     1) auto_detect_and_deploy_certs ;;
                     2) apply_wildcard_cert ;;
@@ -2988,7 +3105,7 @@ deploy_cert_interactive_menu() {
             echo "  3. 申请 SAN 多域名证书"
             echo "  0. 跳过"
             echo ""
-            read -p "请选择 [0/1/2/3]: " retry_choice
+            read -ep "请选择 [0/1/2/3]: " retry_choice
             case $retry_choice in
                 1) auto_detect_and_deploy_certs ;;
                 2) apply_wildcard_cert ;;
@@ -3020,7 +3137,7 @@ deploy_cert_interactive_menu() {
                 echo "  2. 申请通配符证书"
                 echo "  0. 跳过"
                 echo ""
-                read -p "请选择 [0/1/2]: " retry_choice
+                read -ep "请选择 [0/1/2]: " retry_choice
                 case $retry_choice in
                     1) auto_detect_and_deploy_certs ;;
                     2) apply_wildcard_cert ;;
@@ -3053,7 +3170,7 @@ deploy_cert_interactive_menu() {
                 echo "  3. 申请 SAN 多域名证书"
                 echo "  0. 跳过"
                 echo ""
-                read -p "请选择 [0/1/3]: " retry_choice
+                read -ep "请选择 [0/1/3]: " retry_choice
                 case $retry_choice in
                     1) auto_detect_and_deploy_certs ;;
                     3) apply_san_cert ;;
@@ -3081,7 +3198,7 @@ deploy_container() {
         log_warning "此模式将所有端口暴露到所有网络接口（含公网！）"
         log_warning "HTTPS(${HTTPS_PORT}) GW(${GW_PORT}) MQTT(${MQTT_PORT}) MQTTS(${MQTTS_PORT})"
         echo ""
-        read -p "确认继续? [y/N]: " confirm
+        read -ep "确认继续? [y/N]: " confirm
         if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
             log_info "已取消部署"
             return 1
@@ -3137,12 +3254,6 @@ deploy_container() {
 
     start_new_container "$mode"
     save_deploy_mode "$mode"
-
-    # v9.0: 使用反向代理时，自动检测并配置 Nginx Range 头透传
-    local RP_MODE=$(get_reverse_proxy_mode)
-    if [ "$RP_MODE" = "yes" ]; then
-        auto_configure_nginx_range
-    fi
 
     if health_check; then
         cleanup_old_images
@@ -3471,7 +3582,7 @@ reset_admin_password() {
     echo "  • 系统会重新生成随机密码"
     echo "  • 所有已添加的用户将丢失"
     echo ""
-    read -p "确定要重置密码吗？(输入 yes 确认): " CONFIRM
+    read -ep "确定要重置密码吗？(输入 yes 确认): " CONFIRM
 
     if [ "$CONFIRM" != "yes" ]; then
         log_info "操作已取消"
@@ -3550,7 +3661,7 @@ check_for_updates() {
     else
         log_info "发现新版本可用！"
         echo ""
-        read -p "是否立即更新？(输入 yes 确认): " UPDATE_CONFIRM
+        read -ep "是否立即更新？(输入 yes 确认): " UPDATE_CONFIRM
         if [ "${UPDATE_CONFIRM}" = "yes" ]; then
             local CURRENT_MODE=$(get_deploy_mode)
             if [ "${CURRENT_MODE}" = "unknown" ]; then
@@ -3591,7 +3702,7 @@ backup_data() {
     log_highlight "  备份文件: ${BACKUP_FILE}"
     echo ""
 
-    read -p "确认开始备份？[y/N]: " CONFIRM
+    read -ep "确认开始备份？[y/N]: " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         log_info "备份已取消"
         return 0
@@ -3632,7 +3743,7 @@ restore_data() {
 
     if [ ! -d "${BACKUP_BASE_DIR}" ]; then
         log_warning "备份目录不存在: ${BACKUP_BASE_DIR}"
-        read -p "指定备份文件路径 (或 n 取消): " CUSTOM_BACKUP
+        read -ep "指定备份文件路径 (或 n 取消): " CUSTOM_BACKUP
         if [ "${CUSTOM_BACKUP}" = "n" ] || [ -z "${CUSTOM_BACKUP}" ]; then
             return 0
         fi
@@ -3658,9 +3769,9 @@ restore_data() {
         echo "  [0] 指定其他路径"
         echo ""
 
-        read -p "请选择 [0-${#BACKUP_FILES[@]}]: " CHOICE
+        read -ep "请选择 [0-${#BACKUP_FILES[@]}]: " CHOICE
         if [ "${CHOICE}" = "0" ]; then
-            read -p "备份文件路径: " CUSTOM_BACKUP
+            read -ep "备份文件路径: " CUSTOM_BACKUP
             if [ ! -f "${CUSTOM_BACKUP}" ]; then
                 log_error "文件不存在"
                 return 1
@@ -3678,7 +3789,7 @@ restore_data() {
     echo -e "${YELLOW}⚠️ 警告：此操作将覆盖当前所有数据！${NC}"
     echo "  包括: 用户配置、固件文件等"
     echo ""
-    read -p "确认恢复？(输入 yes 确认): " CONFIRM
+    read -ep "确认恢复？(输入 yes 确认): " CONFIRM
     if [ "${CONFIRM}" != "yes" ]; then
         log_info "操作已取消"
         return 0
@@ -3763,11 +3874,11 @@ view_backups() {
     echo "  3. 清理旧备份（保留最新3个）"
     echo "  0. 返回"
     echo ""
-    read -p "请选择 [0-3]: " ACTION
+    read -ep "请选择 [0-3]: " ACTION
 
     case $ACTION in
         1)
-            read -p "查看第几个备份? [1-${#BACKUP_FILES[@]}]: " VIEW_IDX
+            read -ep "查看第几个备份? [1-${#BACKUP_FILES[@]}]: " VIEW_IDX
             if [ "${VIEW_IDX}" -ge 1 ] 2>/dev/null && [ "${VIEW_IDX}" -le ${#BACKUP_FILES[@]} ] 2>/dev/null; then
                 local FILE="${BACKUP_FILES[$((VIEW_IDX-1))]}"
                 echo ""
@@ -3780,10 +3891,10 @@ view_backups() {
             fi
             ;;
         2)
-            read -p "删除第几个备份? [1-${#BACKUP_FILES[@]}]: " DEL_IDX
+            read -ep "删除第几个备份? [1-${#BACKUP_FILES[@]}]: " DEL_IDX
             if [ "${DEL_IDX}" -ge 1 ] 2>/dev/null && [ "${DEL_IDX}" -le ${#BACKUP_FILES[@]} ] 2>/dev/null; then
                 local FILE="${BACKUP_FILES[$((DEL_IDX-1))]}"
-                read -p "确认删除 $(basename ${FILE})? [y/N]: " CONFIRM
+                read -ep "确认删除 $(basename ${FILE})? [y/N]: " CONFIRM
                 if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
                     rm -f "${FILE}"
                     log_success "已删除: $(basename ${FILE})"
@@ -3798,7 +3909,7 @@ view_backups() {
             else
                 local TO_DELETE=$((${#BACKUP_FILES[@]} - 3))
                 echo "将删除 ${TO_DELETE} 个旧备份，保留最新3个"
-                read -p "确认? [y/N]: " CONFIRM
+                read -ep "确认? [y/N]: " CONFIRM
                 if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
                     for ((i=3; i<${#BACKUP_FILES[@]}; i++)); do
                         rm -f "${BACKUP_FILES[$i]}"
@@ -3835,7 +3946,7 @@ view_logs() {
     echo "  8. 查看设备连接记录"
     echo "  0. 返回"
     echo ""
-    read -p "请选择 [0-8]: " LOG_CHOICE
+    read -ep "请选择 [0-8]: " LOG_CHOICE
 
     case ${LOG_CHOICE} in
         1) docker logs --tail 50 ${CONTAINER_NAME} 2>&1 ;;
@@ -3848,7 +3959,7 @@ view_logs() {
             trap - SIGINT
             ;;
         5)
-            read -p "输入搜索关键词: " KEYWORD
+            read -ep "输入搜索关键词: " KEYWORD
             if [ -n "${KEYWORD}" ]; then
                 docker logs ${CONTAINER_NAME} 2>&1 | grep -i --color=always "${KEYWORD}" | tail -50
             fi
@@ -3984,60 +4095,60 @@ interactive_menu() {
         echo "  12. 退出"
         echo -e "  ${RED}13.${NC} 一键部署 ${RED}(仅测试-不安全)${NC}"
         echo ""
-        read -p "请选择操作 [1-15]: " choice
+        read -ep "请选择操作 [1-15]: " choice
 
         case $choice in
             1)
                 deploy_container "production"
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             2)
                 check_volumes
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             3)
                 if check_container_installed; then
                     show_deployment_info
                 fi
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             4)
                 if check_container_running; then
                     reset_admin_password
                 fi
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             5)
                 if check_container_installed; then
                     check_for_updates
                 fi
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             6)
                 backup_data
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             7)
                 restore_data
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             8)
                 view_backups
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             9)
                 if check_container_installed; then
                     view_logs
                 fi
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             10)
                 menu_set_mqtt_addr
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             11)
                 menu_cert_management
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             12)
                 echo ""
@@ -4053,15 +4164,15 @@ interactive_menu() {
                 echo -e "${YELLOW}仅建议用于临时测试，测试完成后请用菜单 [1] 重新部署${NC}"
                 echo ""
                 deploy_container "test"
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             14)
                 menu_firmware_domain
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             15)
                 menu_nginx_range
-                read -p "按Enter键返回菜单..." dummy
+                read -ep "按Enter键返回菜单..." dummy
                 ;;
             *)
                 log_warning "无效选择，请输入 1-15"
