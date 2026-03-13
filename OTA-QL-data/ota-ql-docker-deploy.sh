@@ -5,8 +5,8 @@
 # 文件名: ota-ql-docker-deploy.sh
 # 用途: 首次部署、滚动更新、备份恢复、密码重置、存储卷检查、日志管理、SSL证书管理
 # 作者: WiseFido Technologies
-# 版本: v8.9
-# 更新: 2026-03-08
+# 版本: v9.0
+# 更新: 2026-03-14
 #
 # 一键部署（推荐）:
 #   wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisefido/public-data/main/OTA-QL-data/ota-ql-docker-deploy.sh" && chmod +x ota-ql-docker-deploy.sh && sudo ./ota-ql-docker-deploy.sh
