@@ -57,6 +57,7 @@ HTTP_FW_PORT="10089"     # v4.6: ESP32 OTA明文固件下载
 GW_PORT="10086"          # cmux设备网关（TCP+TLS自动识别）
 MQTT_PORT="1883"         # MQTT Broker（明文）
 MQTTS_PORT="8883"        # MQTT Broker（TLS加密）
+LEGACY_PORT="1060"       # v16.3: 遗留端口兼容（旧固件工厂默认端口）
 
 # 环境变量覆盖（OTA_MQTT_ADDR 优先级最高，兼容旧名OTA_SERVER_ADDR，留空则自动检测本机IP）
 SERVER_ADDR="${OTA_MQTT_ADDR:-${OTA_SERVER_ADDR:-}}"
@@ -370,6 +371,7 @@ start_new_container() {
         -p ${GW_BIND}:${GW_PORT}:10086 \
         -p ${MQTT_BIND}:${MQTT_PORT}:1883 \
         -p ${MQTTS_BIND}:${MQTTS_PORT}:8883 \
+        -p 0.0.0.0:${LEGACY_PORT}:${LEGACY_PORT} \
         -v ${FIRMWARE_DIR}:/app/firmware \
         -v ${APP_DATA_DIR}:/app/data \
         -v ${CERTS_DIR}:/app/certs:ro \
@@ -2448,9 +2450,12 @@ menu_cert_management() {
     echo "  7. 查询证书覆盖情况（MQTT/网关/Web面板）"
     echo "  8. 交互式申请 SAN 多域名证书"
     echo "  9. 交互式申请通配符证书"
+    echo -e "  ${CYAN}10.${NC} 申请单域名 Let's Encrypt 证书"
+    echo -e "  ${CYAN}11.${NC} 手动续期证书"
+    echo -e "  ${CYAN}12.${NC} 设置/管理证书自动续期 (cron)"
     echo "  0. 返回主菜单"
     echo ""
-    read -ep "请选择 [0-9]: " cert_choice
+    read -ep "请选择 [0-12]: " cert_choice
 
     case $cert_choice in
         1)
@@ -2523,6 +2528,15 @@ menu_cert_management() {
             ;;
         9)
             apply_wildcard_cert
+            ;;
+        10)
+            apply_single_domain_cert
+            ;;
+        11)
+            renew_cert_manual
+            ;;
+        12)
+            setup_cert_auto_renew
             ;;
         0)
             return 0
@@ -2991,6 +3005,297 @@ apply_san_cert() {
     fi
 }
 
+# v16.3: 单域名 Let's Encrypt 证书申请
+apply_single_domain_cert() {
+    echo ""
+    echo "=========================================="
+    echo "  申请单域名 Let's Encrypt 证书"
+    echo "=========================================="
+    echo ""
+
+    local cb_addr=$(get_mqtt_addr)
+
+    echo -e "${BOLD}单域名证书说明:${NC}"
+    echo "  • 为一个域名申请 Let's Encrypt 免费证书"
+    echo "  • 支持 HTTP 文件验证（端口80）或 DNS 验证"
+    echo "  • 证书有效期90天，支持自动/手动续期"
+    echo ""
+
+    local default_domain=""
+    if [ -n "$cb_addr" ] && ! echo "$cb_addr" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        default_domain="$cb_addr"
+        echo -e "  当前MQTT域名: ${CYAN}${default_domain}${NC}"
+        echo ""
+    fi
+
+    read -ep "请输入域名 (如 ota.wisefido.com): " input_domain
+    if [ -z "$input_domain" ] && [ -n "$default_domain" ]; then
+        input_domain="$default_domain"
+        echo "  使用当前域名: $input_domain"
+    fi
+    if [ -z "$input_domain" ]; then
+        log_warning "未输入域名，取消操作"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${BOLD}选择验证方式:${NC}"
+    echo "  1. HTTP 文件验证（--standalone，需要端口80空闲）"
+    echo "  2. DNS 验证（--manual --preferred-challenges dns，需手动添加TXT记录）"
+    echo "  3. Nginx 插件（--nginx，需已安装 certbot-nginx）"
+    echo ""
+    read -ep "请选择 [1-3]: " verify_method
+
+    local verify_args=""
+    case $verify_method in
+        1)
+            verify_args="--standalone"
+            echo ""
+            echo -e "${YELLOW}注意: HTTP 验证需要端口 80 空闲${NC}"
+            echo -e "${YELLOW}      如 Nginx 占用端口 80，请先停止: sudo systemctl stop nginx${NC}"
+            ;;
+        2)
+            verify_args="--manual --preferred-challenges dns"
+            echo ""
+            echo -e "${YELLOW}注意: DNS 验证需要手动在域名管理面板添加 TXT 记录${NC}"
+            ;;
+        3)
+            verify_args="--nginx"
+            ;;
+        *)
+            verify_args="--standalone"
+            ;;
+    esac
+
+    echo ""
+    echo -e "${BOLD}即将执行:${NC}"
+    echo -e "  ${CYAN}sudo certbot certonly ${verify_args} -d ${input_domain}${NC}"
+    echo ""
+    read -ep "是否继续? [Y/n]: " proceed
+    if [[ "$proceed" =~ ^[Nn]$ ]]; then
+        return 1
+    fi
+
+    # 检查certbot
+    if ! command -v certbot &> /dev/null; then
+        log_warning "certbot 未安装，正在安装..."
+        if command -v apt &> /dev/null; then
+            sudo apt update && sudo apt install -y certbot
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y certbot
+        else
+            log_error "无法自动安装 certbot，请手动安装"
+            return 1
+        fi
+    fi
+
+    sudo certbot certonly ${verify_args} -d "${input_domain}"
+
+    if [ $? -eq 0 ]; then
+        log_success "单域名证书申请成功！"
+        local cert_path="/etc/letsencrypt/live/${input_domain}/fullchain.pem"
+        local key_path="/etc/letsencrypt/live/${input_domain}/privkey.pem"
+
+        if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+            echo ""
+            echo -e "  证书: ${cert_path}"
+            echo -e "  私钥: ${key_path}"
+            if command -v openssl &> /dev/null; then
+                local expiry=$(openssl x509 -in "$cert_path" -noout -enddate 2>/dev/null | cut -d= -f2)
+                echo -e "  到期: ${expiry}"
+            fi
+            echo ""
+            read -ep "是否部署此证书到 OTA-QL? [Y/n]: " deploy_confirm
+            if [[ ! "$deploy_confirm" =~ ^[Nn]$ ]]; then
+                deploy_cert_to_ota "$cert_path" "$key_path" "Let's Encrypt (${input_domain})"
+                return $?
+            fi
+        else
+            log_warning "证书未在预期路径找到，请检查 /etc/letsencrypt/live/"
+            return 1
+        fi
+    else
+        log_error "证书申请失败！"
+        echo "  常见原因:"
+        echo "  1. 端口80被占用（HTTP验证）"
+        echo "  2. DNS TXT 记录未添加（DNS验证）"
+        echo "  3. 域名未指向本服务器IP"
+        return 1
+    fi
+}
+
+# v16.3: 手动续期证书
+renew_cert_manual() {
+    echo ""
+    echo "=========================================="
+    echo "  手动续期 Let's Encrypt 证书"
+    echo "=========================================="
+    echo ""
+
+    # 列出已有的证书
+    if ! command -v certbot &> /dev/null; then
+        log_error "certbot 未安装，无法续期"
+        return 1
+    fi
+
+    echo -e "${BOLD}已有的 Let's Encrypt 证书:${NC}"
+    echo ""
+    sudo certbot certificates 2>/dev/null
+    echo ""
+
+    echo -e "${BOLD}选择续期方式:${NC}"
+    echo "  1. 续期所有即将到期的证书 (certbot renew)"
+    echo "  2. 强制续期指定域名证书"
+    echo "  0. 取消"
+    echo ""
+    read -ep "请选择 [0-2]: " renew_choice
+
+    case $renew_choice in
+        1)
+            echo ""
+            echo -e "  ${CYAN}sudo certbot renew${NC}"
+            echo ""
+            sudo certbot renew
+            if [ $? -eq 0 ]; then
+                log_success "证书续期完成"
+                echo ""
+                read -ep "是否重新部署证书到 OTA-QL 并重启容器? [Y/n]: " redeploy
+                if [[ ! "$redeploy" =~ ^[Nn]$ ]]; then
+                    _redeploy_letsencrypt_cert
+                fi
+            else
+                log_error "证书续期失败"
+            fi
+            ;;
+        2)
+            read -ep "请输入要续期的域名: " renew_domain
+            if [ -z "$renew_domain" ]; then
+                log_warning "未输入域名"
+                return 1
+            fi
+            echo ""
+            echo -e "  ${CYAN}sudo certbot certonly --force-renewal -d ${renew_domain}${NC}"
+            echo ""
+            echo -e "${BOLD}选择验证方式:${NC}"
+            echo "  1. HTTP 文件验证（--standalone）"
+            echo "  2. DNS 验证（--manual --preferred-challenges dns）"
+            echo "  3. Nginx 插件（--nginx）"
+            read -ep "请选择 [1-3]: " v_method
+            local v_args="--standalone"
+            case $v_method in
+                2) v_args="--manual --preferred-challenges dns" ;;
+                3) v_args="--nginx" ;;
+            esac
+            sudo certbot certonly --force-renewal ${v_args} -d "${renew_domain}"
+            if [ $? -eq 0 ]; then
+                log_success "域名 ${renew_domain} 证书续期成功"
+                read -ep "是否重新部署证书到 OTA-QL 并重启容器? [Y/n]: " redeploy
+                if [[ ! "$redeploy" =~ ^[Nn]$ ]]; then
+                    _redeploy_letsencrypt_cert "$renew_domain"
+                fi
+            else
+                log_error "证书续期失败"
+            fi
+            ;;
+        0)
+            return 0
+            ;;
+    esac
+}
+
+# v16.3: 设置证书自动续期 (cron)
+setup_cert_auto_renew() {
+    echo ""
+    echo "=========================================="
+    echo "  设置证书自动续期 (cron)"
+    echo "=========================================="
+    echo ""
+
+    echo -e "${BOLD}Let's Encrypt 证书有效期90天，建议设置自动续期${NC}"
+    echo ""
+
+    # 检查现有 cron 任务
+    local existing_cron=$(sudo crontab -l 2>/dev/null | grep "certbot renew" || true)
+    if [ -n "$existing_cron" ]; then
+        echo -e "  ${GREEN}✓ 已存在自动续期任务:${NC}"
+        echo "    $existing_cron"
+        echo ""
+        echo "  1. 保持现有设置"
+        echo "  2. 删除现有设置"
+        echo "  3. 替换为新设置"
+        read -ep "请选择 [1-3]: " cron_choice
+        case $cron_choice in
+            1) return 0 ;;
+            2)
+                sudo crontab -l 2>/dev/null | grep -v "certbot renew" | sudo crontab -
+                log_success "已删除自动续期任务"
+                return 0
+                ;;
+            3)
+                sudo crontab -l 2>/dev/null | grep -v "certbot renew" | sudo crontab -
+                ;;
+        esac
+    fi
+
+    echo -e "${BOLD}自动续期方案:${NC}"
+    echo "  每天凌晨3点检查并续期证书，续期成功后自动重启OTA-QL容器"
+    echo ""
+    echo -e "  ${CYAN}0 3 * * * certbot renew --quiet --deploy-hook \"docker restart ${CONTAINER_NAME}\"${NC}"
+    echo ""
+    read -ep "是否设置自动续期? [Y/n]: " auto_confirm
+    if [[ "$auto_confirm" =~ ^[Nn]$ ]]; then
+        return 0
+    fi
+
+    # 添加 cron 任务
+    local cron_cmd="0 3 * * * certbot renew --quiet --deploy-hook \"docker restart ${CONTAINER_NAME}\" >> /var/log/certbot-renew.log 2>&1"
+    (sudo crontab -l 2>/dev/null; echo "$cron_cmd") | sudo crontab -
+
+    if [ $? -eq 0 ]; then
+        log_success "自动续期任务已设置"
+        echo ""
+        echo -e "  ${GREEN}✓ 每天凌晨 3:00 自动检查并续期${NC}"
+        echo -e "  ${GREEN}✓ 续期成功后自动重启容器${NC}"
+        echo -e "  ${GREEN}✓ 日志: /var/log/certbot-renew.log${NC}"
+        echo ""
+        echo -e "  验证: ${CYAN}sudo crontab -l | grep certbot${NC}"
+    else
+        log_error "cron 任务设置失败"
+    fi
+}
+
+# v16.3: 内部函数 - 重新部署 Let's Encrypt 证书到 OTA-QL
+_redeploy_letsencrypt_cert() {
+    local domain="${1:-}"
+
+    if [ -z "$domain" ]; then
+        # 从当前部署的证书推断域名
+        if [ -f "${CERTS_DIR}/fullchain.pem" ] && command -v openssl &> /dev/null; then
+            domain=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1)
+        fi
+    fi
+
+    if [ -z "$domain" ]; then
+        log_warning "无法确定域名，请使用菜单 2 手动部署"
+        return 1
+    fi
+
+    local cert_path="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    local key_path="/etc/letsencrypt/live/${domain}/privkey.pem"
+
+    if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+        deploy_cert_to_ota "$cert_path" "$key_path" "Let's Encrypt 续期 (${domain})"
+        if [ $? -eq 0 ]; then
+            docker restart ${CONTAINER_NAME} > /dev/null 2>&1
+            sleep 3
+            log_success "证书已更新，容器已重启"
+        fi
+    else
+        log_warning "证书文件不存在: ${cert_path}"
+        return 1
+    fi
+}
+
 # v5.3: 部署时的SSL证书交互式菜单
 # 替代v5.0的auto_detect_and_deploy_certs，由用户主动选择证书获取方式
 deploy_cert_interactive_menu() {
@@ -3392,6 +3697,22 @@ show_production_deploy_success() {
         echo -e "  ${YELLOW}!${NC} 使用自签名证书，建议菜单 [11] 配置CA证书"
     fi
     echo ""
+
+    echo -e "${BG_YELLOW}${BOLD}  🔥 防火墙/安全组 必须开放端口  ${NC}"
+    echo "  ┌──────────┬──────────┬───────────────────────────────────┐"
+    echo "  │ 端口     │ 方向     │ 用途                              │"
+    echo "  ├──────────┼──────────┼───────────────────────────────────┤"
+    echo "  │ 443      │ 入站     │ Nginx HTTPS (Web+API+固件下载)    │"
+    echo "  │ 80       │ 入站     │ HTTP→HTTPS 重定向                │"
+    echo "  │ ${GW_PORT}   │ 入站     │ cmux网关 (TCP+TLS设备直连)        │"
+    echo "  │ ${MQTT_PORT}    │ 入站     │ MQTT 设备直连                     │"
+    echo "  │ ${MQTTS_PORT}    │ 入站     │ MQTTS/TLS 设备直连               │"
+    echo "  │ ${LEGACY_PORT}    │ 入站     │ 遗留端口 (旧固件兼容,可选)       │"
+    echo "  │ 22       │ 入站     │ SSH 管理 (可限制IP)               │"
+    echo "  └──────────┴──────────┴───────────────────────────────────┘"
+    echo -e "  ${YELLOW}⚠️  10088/10089 无需外部开放 (仅 127.0.0.1 反代)${NC}"
+    echo -e "  ${CYAN}💡 云服务器请在安全组中开放以上端口${NC}"
+    echo ""
 }
 
 show_test_deploy_success() {
@@ -3474,6 +3795,22 @@ show_test_deploy_success() {
     echo -e "${BG_RED}${BOLD}  ⚠️ 安全警告  ${NC}"
     echo -e "  ${RED}✗${NC} 所有端口暴露到公网，仅供测试使用"
     echo -e "  ${YELLOW}!${NC} 测试完成后请使用菜单 [1] 重新部署为生产环境"
+    echo ""
+
+    echo -e "${BG_YELLOW}${BOLD}  🔥 防火墙/安全组 必须开放端口  ${NC}"
+    echo "  ┌──────────┬──────────┬───────────────────────────────────┐"
+    echo "  │ 端口     │ 方向     │ 用途                              │"
+    echo "  ├──────────┼──────────┼───────────────────────────────────┤"
+    echo "  │ 443      │ 入站     │ Nginx HTTPS (Web+API+固件下载)    │"
+    echo "  │ 80       │ 入站     │ HTTP→HTTPS 重定向                │"
+    echo "  │ ${GW_PORT}   │ 入站     │ cmux网关 (TCP+TLS设备直连)        │"
+    echo "  │ ${MQTT_PORT}    │ 入站     │ MQTT 设备直连                     │"
+    echo "  │ ${MQTTS_PORT}    │ 入站     │ MQTTS/TLS 设备直连               │"
+    echo "  │ ${LEGACY_PORT}    │ 入站     │ 遗留端口 (旧固件兼容,可选)       │"
+    echo "  │ 22       │ 入站     │ SSH 管理 (可限制IP)               │"
+    echo "  └──────────┴──────────┴───────────────────────────────────┘"
+    echo -e "  ${YELLOW}⚠️  测试环境所有端口已暴露，但仍需安全组放行${NC}"
+    echo -e "  ${CYAN}💡 云服务器请在安全组中开放以上端口${NC}"
     echo ""
 }
 
@@ -4063,6 +4400,22 @@ show_deployment_info() {
 
     echo "[资源使用]"
     docker stats ${CONTAINER_NAME} --no-stream --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" 2>/dev/null || log_warning "容器未运行"
+    echo ""
+
+    echo -e "${BG_YELLOW}${BOLD}  🔥 防火墙/安全组 必须开放端口  ${NC}"
+    echo "  ┌──────────┬──────────┬───────────────────────────────────┐"
+    echo "  │ 端口     │ 方向     │ 用途                              │"
+    echo "  ├──────────┼──────────┼───────────────────────────────────┤"
+    echo "  │ 443      │ 入站     │ Nginx HTTPS (Web+API+固件下载)    │"
+    echo "  │ 80       │ 入站     │ HTTP→HTTPS 重定向                │"
+    echo "  │ ${GW_PORT}   │ 入站     │ cmux网关 (TCP+TLS设备直连)        │"
+    echo "  │ ${MQTT_PORT}    │ 入站     │ MQTT 设备直连                     │"
+    echo "  │ ${MQTTS_PORT}    │ 入站     │ MQTTS/TLS 设备直连               │"
+    echo "  │ ${LEGACY_PORT}    │ 入站     │ 遗留端口 (旧固件兼容,可选)       │"
+    echo "  │ 22       │ 入站     │ SSH 管理 (可限制IP)               │"
+    echo "  └──────────┴──────────┴───────────────────────────────────┘"
+    echo -e "  ${YELLOW}⚠️  10088/10089 无需外部开放 (仅 127.0.0.1 反代)${NC}"
+    echo -e "  ${CYAN}💡 云服务器请在安全组中开放以上端口${NC}"
     echo ""
 }
 
