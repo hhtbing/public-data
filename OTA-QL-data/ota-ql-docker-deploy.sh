@@ -2453,9 +2453,11 @@ menu_cert_management() {
     echo -e "  ${CYAN}10.${NC} 申请单域名 Let's Encrypt 证书"
     echo -e "  ${CYAN}11.${NC} 手动续期证书"
     echo -e "  ${CYAN}12.${NC} 设置/管理证书自动续期 (cron)"
+    echo -e "  ${CYAN}13.${NC} 🔍 智能搜索证书 + 一键续期"
+    echo -e "  ${CYAN}14.${NC} 🔄 智能搜索证书 + 自动续期"
     echo "  0. 返回主菜单"
     echo ""
-    read -ep "请选择 [0-12]: " cert_choice
+    read -ep "请选择 [0-14]: " cert_choice
 
     case $cert_choice in
         1)
@@ -2537,6 +2539,12 @@ menu_cert_management() {
             ;;
         12)
             setup_cert_auto_renew
+            ;;
+        13)
+            smart_renew_cert_interactive
+            ;;
+        14)
+            smart_auto_renew_cert
             ;;
         0)
             return 0
@@ -3293,6 +3301,491 @@ _redeploy_letsencrypt_cert() {
     else
         log_warning "证书文件不存在: ${cert_path}"
         return 1
+    fi
+}
+
+# v16.5 P2-A: 智能搜索已部署证书 + 一键续期
+# 多方式搜索兼容：certbot、acme.sh、宝塔、1Panel、aaPanel、CyberPanel、Nginx、Apache、Caddy
+smart_renew_cert_interactive() {
+    echo ""
+    echo "=========================================="
+    echo "  🔍 智能搜索证书 + 一键续期"
+    echo "=========================================="
+    echo ""
+
+    # ---- 第一步：兼容多面板/工具搜索所有证书 ----
+    log_info "正在搜索系统中所有已部署的SSL证书..."
+    echo ""
+
+    local search_dirs=(
+        "/www/server/panel/vhost/cert"      # 宝塔面板
+        "/www/server/panel/vhost/ssl"       # 宝塔面板(旧版)
+        "/etc/letsencrypt/live"             # certbot / Let's Encrypt
+        "/root/.acme.sh"                    # acme.sh
+        "/home/*/.acme.sh"                  # acme.sh (非root用户)
+        "/opt/1panel/apps/openresty/openresty/conf/ssl" # 1Panel openresty
+        "/opt/1panel/resource/apps/openresty/openresty/conf/ssl" # 1Panel v2
+        "/etc/nginx/ssl"                    # Nginx
+        "/etc/nginx/conf.d/ssl"             # Nginx conf.d
+        "/etc/apache2/ssl"                  # Apache (Debian/Ubuntu)
+        "/etc/httpd/ssl"                    # Apache (CentOS/RHEL)
+        "/usr/local/appnode/nginx/conf/ssl" # AppNode
+        "/var/lib/caddy"                    # Caddy
+        "/usr/local/lsws/conf"              # OpenLiteSpeed
+        "/etc/pki/tls/certs"                # CentOS 系统证书
+        "/usr/syno/etc/certificate"         # Synology NAS
+    )
+
+    local total=0
+    local CERT_LIST=()
+    local CERT_TOOLS=()
+    local seen_real=()
+
+    for sdir in "${search_dirs[@]}"; do
+        # 支持通配符展开
+        for resolved_dir in $sdir; do
+            [ -d "$resolved_dir" ] || continue
+            local certs=$(find "$resolved_dir" -maxdepth 4 \( -name "fullchain.pem" -o -name "fullchain.cer" -o -name "cert.pem" -o -name "certificate.crt" \) 2>/dev/null)
+            [ -z "$certs" ] && continue
+
+            while IFS= read -r cert_file; do
+                local cert_dir=$(dirname "$cert_file")
+                local domain_guess=$(basename "$cert_dir")
+
+                # 查找私钥
+                local key_file=""
+                for kn in "privkey.pem" "private.key" "${domain_guess}.key" "key.pem" "privkey.key"; do
+                    if [ -f "${cert_dir}/${kn}" ]; then key_file="${cert_dir}/${kn}"; break; fi
+                done
+                [ -z "$key_file" ] && continue
+
+                # realpath 去重
+                local real_c=$(realpath "$cert_file" 2>/dev/null || readlink -f "$cert_file" 2>/dev/null || echo "$cert_file")
+                local dedup="${real_c}"
+                local dup=false
+                for s in "${seen_real[@]}"; do [ "$s" = "$dedup" ] && dup=true && break; done
+                $dup && continue
+                seen_real+=("$dedup")
+
+                # 提取证书信息
+                local cn="" expiry="" issuer="" days_left="" san_list=""
+                if command -v openssl &>/dev/null; then
+                    cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1 | xargs)
+                    expiry=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+                    issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/.*O\s*=\s*//' | cut -d'/' -f1 | cut -d',' -f1 | xargs)
+                    san_list=$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | grep -oP 'DNS:[^\s,]+' | sed 's/DNS://g' | tr '\n' ',' | sed 's/,$//')
+                    # 计算剩余天数
+                    local exp_epoch=$(date -d "$expiry" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry" +%s 2>/dev/null || echo "0")
+                    local now_epoch=$(date +%s)
+                    if [ "$exp_epoch" -gt 0 ] 2>/dev/null; then
+                        days_left=$(( (exp_epoch - now_epoch) / 86400 ))
+                    fi
+                fi
+
+                # 判断证书来源工具
+                local tool="unknown"
+                case "$cert_file" in
+                    */letsencrypt/*) tool="certbot" ;;
+                    */.acme.sh/*) tool="acme.sh" ;;
+                    */www/server/panel/*) tool="宝塔面板" ;;
+                    */1panel/*) tool="1Panel" ;;
+                    */appnode/*) tool="AppNode" ;;
+                    */caddy*) tool="Caddy" ;;
+                    */lsws/*) tool="OpenLiteSpeed" ;;
+                    */syno/*) tool="Synology" ;;
+                    *) tool="手动部署" ;;
+                esac
+
+                total=$((total + 1))
+                CERT_LIST+=("${cn}|${cert_file}|${key_file}|${expiry}|${days_left}|${issuer}|${san_list}|${cert_dir}")
+                CERT_TOOLS+=("$tool")
+
+                # 显示
+                local color="${GREEN}"
+                local status_icon="✅"
+                if [ -n "$days_left" ] && [ "$days_left" -le 30 ] 2>/dev/null; then
+                    color="${RED}"; status_icon="🔴"
+                elif [ -n "$days_left" ] && [ "$days_left" -le 60 ] 2>/dev/null; then
+                    color="${YELLOW}"; status_icon="🟡"
+                fi
+                echo -e "  [${total}] ${status_icon} ${BOLD}${cn:-$domain_guess}${NC}"
+                echo -e "      来源: ${CYAN}${tool}${NC}  |  签发: ${issuer:-未知}"
+                [ -n "$san_list" ] && echo -e "      SAN域名: ${san_list}"
+                if [ -n "$days_left" ]; then
+                    echo -e "      到期: ${expiry}  (剩余 ${color}${days_left}天${NC})"
+                else
+                    echo -e "      到期: ${expiry:-未知}"
+                fi
+                echo -e "      路径: ${cert_file}"
+                echo ""
+            done <<< "$certs"
+        done
+    done
+
+    if [ $total -eq 0 ]; then
+        echo -e "  ${RED}✗${NC} 未找到任何已部署的SSL证书"
+        echo ""
+        echo "  可能原因:"
+        echo "  1. 服务器尚未申请任何SSL证书"
+        echo "  2. 证书以非标准路径存放"
+        echo "  3. 请使用菜单 10 先申请证书"
+        return 1
+    fi
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_success "共发现 ${total} 个证书"
+    echo ""
+
+    # ---- 第二步：用户选择要续期的证书 ----
+    echo "  输入编号 [1-${total}] 选择要一键续期的证书"
+    echo "  输入 0 返回"
+    echo ""
+    read -ep "请选择: " sel
+
+    if [ "$sel" = "0" ] || [ -z "$sel" ]; then return 0; fi
+    if ! [ "$sel" -ge 1 ] 2>/dev/null || ! [ "$sel" -le $total ] 2>/dev/null; then
+        log_warning "无效选择"; return 1
+    fi
+
+    local chosen="${CERT_LIST[$((sel-1))]}"
+    local ch_cn=$(echo "$chosen" | cut -d'|' -f1)
+    local ch_cert=$(echo "$chosen" | cut -d'|' -f2)
+    local ch_key=$(echo "$chosen" | cut -d'|' -f3)
+    local ch_dir=$(echo "$chosen" | cut -d'|' -f8)
+    local ch_tool="${CERT_TOOLS[$((sel-1))]}"
+
+    echo ""
+    echo -e "  选中: ${BOLD}${ch_cn}${NC} (${ch_tool})"
+    echo ""
+
+    # ---- 第三步：根据来源工具选择续期方式 ----
+    local renew_ok=false
+
+    case "$ch_tool" in
+        "certbot")
+            echo -e "  ${CYAN}使用 certbot 续期...${NC}"
+            # 从路径提取域名: /etc/letsencrypt/live/DOMAIN/
+            local le_domain=$(basename "$(dirname "$ch_cert")")
+            echo -e "  域名: ${le_domain}"
+            echo ""
+            echo -e "  ${BOLD}续期方式:${NC}"
+            echo "    1. 自动续期 (certbot renew --cert-name ${le_domain})"
+            echo "    2. 强制续期 (certbot certonly --force-renewal)"
+            echo "    0. 取消"
+            read -ep "  请选择 [0-2]: " renew_method
+            case $renew_method in
+                1)
+                    sudo certbot renew --cert-name "$le_domain" 2>&1
+                    [ $? -eq 0 ] && renew_ok=true
+                    ;;
+                2)
+                    echo ""
+                    echo -e "  ${BOLD}验证方式:${NC}"
+                    echo "    1. HTTP (--standalone, 需80端口空闲)"
+                    echo "    2. DNS (--manual --preferred-challenges dns)"
+                    echo "    3. Nginx插件 (--nginx)"
+                    read -ep "  请选择 [1-3]: " v_method
+                    local v_args="--standalone"
+                    case $v_method in
+                        2) v_args="--manual --preferred-challenges dns" ;;
+                        3) v_args="--nginx" ;;
+                    esac
+                    sudo certbot certonly --force-renewal ${v_args} -d "$le_domain" 2>&1
+                    [ $? -eq 0 ] && renew_ok=true
+                    ;;
+                0) return 0 ;;
+            esac
+            ;;
+        "acme.sh")
+            echo -e "  ${CYAN}使用 acme.sh 续期...${NC}"
+            local acme_cmd=""
+            [ -f "/root/.acme.sh/acme.sh" ] && acme_cmd="/root/.acme.sh/acme.sh"
+            [ -z "$acme_cmd" ] && acme_cmd=$(find /home -name "acme.sh" -path "*/.acme.sh/*" 2>/dev/null | head -1)
+            if [ -z "$acme_cmd" ]; then
+                log_error "找不到 acme.sh 可执行文件"
+                return 1
+            fi
+            echo ""
+            echo "    1. 续期此域名证书"
+            echo "    2. 强制续期"
+            echo "    0. 取消"
+            read -ep "  请选择 [0-2]: " acme_choice
+            case $acme_choice in
+                1) "$acme_cmd" --renew -d "$ch_cn" 2>&1; [ $? -eq 0 ] && renew_ok=true ;;
+                2) "$acme_cmd" --renew -d "$ch_cn" --force 2>&1; [ $? -eq 0 ] && renew_ok=true ;;
+                0) return 0 ;;
+            esac
+            ;;
+        "宝塔面板")
+            echo -e "  ${CYAN}检测到宝塔面板证书${NC}"
+            echo "  宝塔面板证书通常由面板自动管理续期"
+            echo ""
+            echo "  建议操作:"
+            echo "    1. 登录宝塔面板 → 网站 → SSL → 续期"
+            echo "    2. 或使用系统 certbot/acme.sh 续期后重新部署"
+            echo ""
+            echo -e "  ${YELLOW}是否尝试使用 certbot 强制续期此域名?${NC}"
+            read -ep "  [y/N]: " bt_force
+            if [[ "$bt_force" =~ ^[Yy]$ ]]; then
+                if command -v certbot &>/dev/null; then
+                    sudo certbot certonly --standalone --force-renewal -d "$ch_cn" 2>&1
+                    [ $? -eq 0 ] && renew_ok=true
+                else
+                    log_error "certbot 未安装，请先安装: apt install certbot 或 yum install certbot"
+                fi
+            fi
+            ;;
+        *)
+            echo -e "  ${YELLOW}此证书来源为: ${ch_tool}${NC}"
+            echo "  尝试使用通用方式续期..."
+            echo ""
+            if command -v certbot &>/dev/null; then
+                echo "    1. 使用 certbot 续期域名 ${ch_cn}"
+                echo "    0. 取消"
+                read -ep "  请选择 [0-1]: " gen_choice
+                if [ "$gen_choice" = "1" ]; then
+                    sudo certbot certonly --standalone --force-renewal -d "$ch_cn" 2>&1
+                    [ $? -eq 0 ] && renew_ok=true
+                fi
+            elif [ -f "/root/.acme.sh/acme.sh" ]; then
+                echo "    1. 使用 acme.sh 续期域名 ${ch_cn}"
+                echo "    0. 取消"
+                read -ep "  请选择 [0-1]: " gen_choice
+                if [ "$gen_choice" = "1" ]; then
+                    /root/.acme.sh/acme.sh --renew -d "$ch_cn" --force 2>&1
+                    [ $? -eq 0 ] && renew_ok=true
+                fi
+            else
+                log_error "系统中未找到 certbot 或 acme.sh，请先安装续期工具"
+                return 1
+            fi
+            ;;
+    esac
+
+    echo ""
+    if [ "$renew_ok" = "true" ]; then
+        log_success "证书续期成功: ${ch_cn}"
+        echo ""
+        read -ep "是否重新部署证书到 OTA-QL 并重启容器? [Y/n]: " redeploy
+        if [[ ! "$redeploy" =~ ^[Nn]$ ]]; then
+            _redeploy_letsencrypt_cert "$ch_cn"
+        fi
+    else
+        log_warning "证书续期未完成或已取消"
+    fi
+}
+
+# v16.5 P2-B: 智能搜索已部署证书 + 自动续期 (cron)
+smart_auto_renew_cert() {
+    echo ""
+    echo "=========================================="
+    echo "  🔄 智能搜索证书 + 自动续期配置"
+    echo "=========================================="
+    echo ""
+
+    # ---- 第一步：搜索证书（复用搜索逻辑）----
+    log_info "正在搜索系统中所有已部署的SSL证书..."
+    echo ""
+
+    local search_dirs=(
+        "/www/server/panel/vhost/cert"
+        "/www/server/panel/vhost/ssl"
+        "/etc/letsencrypt/live"
+        "/root/.acme.sh"
+        "/home/*/.acme.sh"
+        "/opt/1panel/apps/openresty/openresty/conf/ssl"
+        "/opt/1panel/resource/apps/openresty/openresty/conf/ssl"
+        "/etc/nginx/ssl"
+        "/etc/nginx/conf.d/ssl"
+        "/etc/apache2/ssl"
+        "/etc/httpd/ssl"
+        "/usr/local/appnode/nginx/conf/ssl"
+        "/var/lib/caddy"
+        "/usr/local/lsws/conf"
+        "/etc/pki/tls/certs"
+        "/usr/syno/etc/certificate"
+    )
+
+    local total=0
+    local CERT_LIST=()
+    local CERT_TOOLS=()
+    local seen_real=()
+
+    for sdir in "${search_dirs[@]}"; do
+        for resolved_dir in $sdir; do
+            [ -d "$resolved_dir" ] || continue
+            local certs=$(find "$resolved_dir" -maxdepth 4 \( -name "fullchain.pem" -o -name "fullchain.cer" -o -name "cert.pem" -o -name "certificate.crt" \) 2>/dev/null)
+            [ -z "$certs" ] && continue
+
+            while IFS= read -r cert_file; do
+                local cert_dir=$(dirname "$cert_file")
+                local domain_guess=$(basename "$cert_dir")
+                local key_file=""
+                for kn in "privkey.pem" "private.key" "${domain_guess}.key" "key.pem" "privkey.key"; do
+                    [ -f "${cert_dir}/${kn}" ] && key_file="${cert_dir}/${kn}" && break
+                done
+                [ -z "$key_file" ] && continue
+                local real_c=$(realpath "$cert_file" 2>/dev/null || readlink -f "$cert_file" 2>/dev/null || echo "$cert_file")
+                local dup=false
+                for s in "${seen_real[@]}"; do [ "$s" = "$real_c" ] && dup=true && break; done
+                $dup && continue
+                seen_real+=("$real_c")
+
+                local cn="" expiry="" issuer="" days_left=""
+                if command -v openssl &>/dev/null; then
+                    cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/.*CN\s*=\s*//' | cut -d'/' -f1 | xargs)
+                    expiry=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+                    issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/.*O\s*=\s*//' | cut -d'/' -f1 | cut -d',' -f1 | xargs)
+                    local exp_epoch=$(date -d "$expiry" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry" +%s 2>/dev/null || echo "0")
+                    local now_epoch=$(date +%s)
+                    [ "$exp_epoch" -gt 0 ] 2>/dev/null && days_left=$(( (exp_epoch - now_epoch) / 86400 ))
+                fi
+
+                local tool="unknown"
+                case "$cert_file" in
+                    */letsencrypt/*) tool="certbot" ;;
+                    */.acme.sh/*) tool="acme.sh" ;;
+                    */www/server/panel/*) tool="宝塔面板" ;;
+                    */1panel/*) tool="1Panel" ;;
+                    */appnode/*) tool="AppNode" ;;
+                    */caddy*) tool="Caddy" ;;
+                    *) tool="其他" ;;
+                esac
+
+                total=$((total + 1))
+                CERT_LIST+=("${cn}|${cert_file}|${key_file}|${expiry}|${days_left}|${issuer}")
+                CERT_TOOLS+=("$tool")
+
+                local color="${GREEN}"
+                [ -n "$days_left" ] && [ "$days_left" -le 30 ] 2>/dev/null && color="${RED}"
+                [ -n "$days_left" ] && [ "$days_left" -le 60 ] 2>/dev/null && [ "$days_left" -gt 30 ] 2>/dev/null && color="${YELLOW}"
+                echo -e "  [${total}] ${BOLD}${cn:-$domain_guess}${NC} (${tool})"
+                [ -n "$days_left" ] && echo -e "      到期剩余: ${color}${days_left}天${NC} — ${expiry}"
+                echo ""
+            done <<< "$certs"
+        done
+    done
+
+    if [ $total -eq 0 ]; then
+        echo -e "  ${RED}✗${NC} 未找到任何已部署的SSL证书"
+        return 1
+    fi
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_success "共发现 ${total} 个证书"
+    echo ""
+    echo "  输入编号 [1-${total}] 选择要设置自动续期的证书"
+    echo "  输入 0 返回"
+    echo ""
+    read -ep "请选择: " sel
+
+    if [ "$sel" = "0" ] || [ -z "$sel" ]; then return 0; fi
+    if ! [ "$sel" -ge 1 ] 2>/dev/null || ! [ "$sel" -le $total ] 2>/dev/null; then
+        log_warning "无效选择"; return 1
+    fi
+
+    local chosen="${CERT_LIST[$((sel-1))]}"
+    local ch_cn=$(echo "$chosen" | cut -d'|' -f1)
+    local ch_cert=$(echo "$chosen" | cut -d'|' -f2)
+    local ch_tool="${CERT_TOOLS[$((sel-1))]}"
+
+    echo ""
+    echo -e "  选中: ${BOLD}${ch_cn}${NC} (${ch_tool})"
+    echo ""
+
+    # ---- 第二步：根据工具类型设置自动续期 ----
+    local cron_cmd=""
+    local deploy_hook="docker restart ${CONTAINER_NAME}"
+
+    case "$ch_tool" in
+        "certbot")
+            local le_domain=$(basename "$(dirname "$ch_cert")")
+            echo -e "  ${CYAN}使用 certbot 自动续期${NC}"
+            echo ""
+            echo -e "  ${BOLD}自动续期方案:${NC}"
+            echo "  每天凌晨3点检查证书 ${le_domain}，到期前自动续期"
+            echo "  续期成功后自动重新部署到 OTA-QL 并重启容器"
+            echo ""
+            cron_cmd="0 3 * * * certbot renew --cert-name ${le_domain} --quiet --deploy-hook \"${deploy_hook}\" >> /var/log/certbot-renew-${le_domain}.log 2>&1"
+            echo -e "  cron 命令: ${CYAN}${cron_cmd}${NC}"
+            ;;
+        "acme.sh")
+            echo -e "  ${CYAN}acme.sh 内置自动续期机制${NC}"
+            echo ""
+            echo "  acme.sh 已默认安装 cron 任务以每天检查续期"
+            echo "  以下操作将添加续期后自动部署到 OTA-QL 的钩子"
+            echo ""
+            local acme_cmd="/root/.acme.sh/acme.sh"
+            [ -f "$acme_cmd" ] || acme_cmd=$(find /home -name "acme.sh" -path "*/.acme.sh/*" 2>/dev/null | head -1)
+            if [ -n "$acme_cmd" ]; then
+                cron_cmd="0 3 * * * ${acme_cmd} --renew -d ${ch_cn} --reloadcmd \"cp -f \$(${acme_cmd} --list -d ${ch_cn} 2>/dev/null | awk 'NR==2{print \$5}')/fullchain.cer ${CERTS_DIR}/fullchain.pem && cp -f \$(${acme_cmd} --list -d ${ch_cn} 2>/dev/null | awk 'NR==2{print \$5}')/${ch_cn}.key ${CERTS_DIR}/privkey.pem && ${deploy_hook}\" >> /var/log/acme-renew-${ch_cn}.log 2>&1"
+            else
+                log_error "找不到 acme.sh"; return 1
+            fi
+            ;;
+        "宝塔面板"|"1Panel"|"AppNode")
+            echo -e "  ${YELLOW}${ch_tool} 通常有内置的自动续期机制${NC}"
+            echo ""
+            echo "  建议:"
+            echo "  1. 在面板管理界面中开启证书自动续期"
+            echo "  2. 添加续期后同步到 OTA-QL 的 cron 任务"
+            echo ""
+            echo -e "  ${BOLD}是否添加证书同步检查任务?${NC}"
+            echo "  (每天检查面板证书是否更新，如有更新则自动同步到 OTA-QL)"
+            echo ""
+            cron_cmd="0 4 * * * if [ ${ch_cert} -nt ${CERTS_DIR}/fullchain.pem ]; then cp -f ${ch_cert} ${CERTS_DIR}/fullchain.pem && cp -f $(echo \"$chosen\" | cut -d'|' -f3) ${CERTS_DIR}/privkey.pem && ${deploy_hook}; fi >> /var/log/cert-sync.log 2>&1"
+            echo -e "  cron 命令: ${CYAN}(每天4:00检查证书文件是否更新)${NC}"
+            ;;
+        *)
+            echo -e "  ${YELLOW}通用自动续期方案${NC}"
+            echo ""
+            if command -v certbot &>/dev/null; then
+                cron_cmd="0 3 * * * certbot renew --quiet --deploy-hook \"${deploy_hook}\" >> /var/log/certbot-renew.log 2>&1"
+                echo "  使用 certbot 通用续期"
+            elif [ -f "/root/.acme.sh/acme.sh" ]; then
+                cron_cmd="0 3 * * * /root/.acme.sh/acme.sh --cron >> /var/log/acme-cron.log 2>&1"
+                echo "  使用 acme.sh 通用续期"
+            else
+                log_error "系统中未找到 certbot 或 acme.sh"
+                return 1
+            fi
+            ;;
+    esac
+
+    echo ""
+    read -ep "是否添加此自动续期任务? [Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then return 0; fi
+
+    # 检查是否已存在相同任务
+    local existing=$(sudo crontab -l 2>/dev/null | grep -F "$ch_cn" || true)
+    if [ -n "$existing" ]; then
+        echo ""
+        echo -e "  ${YELLOW}⚠️  已存在相关的 cron 任务:${NC}"
+        echo "    $existing"
+        echo ""
+        echo "  1. 保留现有，不添加"
+        echo "  2. 替换为新任务"
+        read -ep "  请选择 [1-2]: " dup_choice
+        if [ "$dup_choice" = "2" ]; then
+            sudo crontab -l 2>/dev/null | grep -v -F "$ch_cn" | sudo crontab -
+        else
+            return 0
+        fi
+    fi
+
+    (sudo crontab -l 2>/dev/null; echo "$cron_cmd") | sudo crontab -
+
+    if [ $? -eq 0 ]; then
+        echo ""
+        log_success "自动续期任务已设置: ${ch_cn}"
+        echo ""
+        echo -e "  ${GREEN}✓ 证书: ${ch_cn}${NC}"
+        echo -e "  ${GREEN}✓ 工具: ${ch_tool}${NC}"
+        echo -e "  ${GREEN}✓ 续期后自动重启容器${NC}"
+        echo ""
+        echo -e "  验证: ${CYAN}sudo crontab -l${NC}"
+    else
+        log_error "cron 任务设置失败"
     fi
 }
 
