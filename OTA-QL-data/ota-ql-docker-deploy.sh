@@ -57,7 +57,7 @@ HTTP_FW_PORT="10089"     # v4.6: ESP32 OTA明文固件下载
 GW_PORT="10086"          # cmux设备网关（TCP+TLS自动识别）
 MQTT_PORT="1883"         # MQTT Broker（明文）
 MQTTS_PORT="8883"        # MQTT Broker（TLS加密）
-LEGACY_PORTS="1060,443"    # v16.6: 遗留端口兼容列表（逗号分隔，旧固件+Nginx 443 TLS不兼容ESP32回退）
+LEGACY_PORT="1060"       # v16.3: 遗留端口兼容（旧固件工厂默认端口）
 
 # 环境变量覆盖（OTA_MQTT_ADDR 优先级最高，兼容旧名OTA_SERVER_ADDR，留空则自动检测本机IP）
 SERVER_ADDR="${OTA_MQTT_ADDR:-${OTA_SERVER_ADDR:-}}"
@@ -371,8 +371,7 @@ start_new_container() {
         -p ${GW_BIND}:${GW_PORT}:10086 \
         -p ${MQTT_BIND}:${MQTT_PORT}:1883 \
         -p ${MQTTS_BIND}:${MQTTS_PORT}:8883 \
-        $(IFS=','; for lp in ${LEGACY_PORTS}; do echo "-p 0.0.0.0:${lp}:${lp}"; done | tr '\n' ' ') \
-        -e OTA_LEGACY_PORTS=${LEGACY_PORTS} \
+        -p 0.0.0.0:${LEGACY_PORT}:${LEGACY_PORT} \
         -v ${FIRMWARE_DIR}:/app/firmware \
         -v ${APP_DATA_DIR}:/app/data \
         -v ${CERTS_DIR}:/app/certs:ro \
@@ -4196,12 +4195,12 @@ show_production_deploy_success() {
     echo "  ┌──────────┬──────────┬───────────────────────────────────┐"
     echo "  │ 端口     │ 方向     │ 用途                              │"
     echo "  ├──────────┼──────────┼───────────────────────────────────┤"
-    echo "  │ 443      │ 入站     │ 设备cmux+Nginx HTTPS             │"
+    echo "  │ 443      │ 入站     │ Nginx HTTPS (Web+API+固件下载)    │"
     echo "  │ 80       │ 入站     │ HTTP→HTTPS 重定向                │"
     echo "  │ ${GW_PORT}   │ 入站     │ cmux网关 (TCP+TLS设备直连)        │"
     echo "  │ ${MQTT_PORT}    │ 入站     │ MQTT 设备直连                     │"
     echo "  │ ${MQTTS_PORT}    │ 入站     │ MQTTS/TLS 设备直连               │"
-    echo "  │ 1060     │ 入站     │ 遗留端口 (旧固件兼容)            │"
+    echo "  │ ${LEGACY_PORT}    │ 入站     │ 遗留端口 (旧固件兼容,可选)       │"
     echo "  │ 22       │ 入站     │ SSH 管理 (可限制IP)               │"
     echo "  └──────────┴──────────┴───────────────────────────────────┘"
     echo -e "  ${YELLOW}⚠️  10088/10089 无需外部开放 (仅 127.0.0.1 反代)${NC}"
@@ -4295,12 +4294,12 @@ show_test_deploy_success() {
     echo "  ┌──────────┬──────────┬───────────────────────────────────┐"
     echo "  │ 端口     │ 方向     │ 用途                              │"
     echo "  ├──────────┼──────────┼───────────────────────────────────┤"
-    echo "  │ 443      │ 入站     │ 设备cmux+Nginx HTTPS             │"
+    echo "  │ 443      │ 入站     │ Nginx HTTPS (Web+API+固件下载)    │"
     echo "  │ 80       │ 入站     │ HTTP→HTTPS 重定向                │"
     echo "  │ ${GW_PORT}   │ 入站     │ cmux网关 (TCP+TLS设备直连)        │"
     echo "  │ ${MQTT_PORT}    │ 入站     │ MQTT 设备直连                     │"
     echo "  │ ${MQTTS_PORT}    │ 入站     │ MQTTS/TLS 设备直连               │"
-    echo "  │ 1060     │ 入站     │ 遗留端口 (旧固件兼容)            │"
+    echo "  │ ${LEGACY_PORT}    │ 入站     │ 遗留端口 (旧固件兼容,可选)       │"
     echo "  │ 22       │ 入站     │ SSH 管理 (可限制IP)               │"
     echo "  └──────────┴──────────┴───────────────────────────────────┘"
     echo -e "  ${YELLOW}⚠️  测试环境所有端口已暴露，但仍需安全组放行${NC}"
@@ -4900,12 +4899,12 @@ show_deployment_info() {
     echo "  ┌──────────┬──────────┬───────────────────────────────────┐"
     echo "  │ 端口     │ 方向     │ 用途                              │"
     echo "  ├──────────┼──────────┼───────────────────────────────────┤"
-    echo "  │ 443      │ 入站     │ 设备cmux+Nginx HTTPS             │"
+    echo "  │ 443      │ 入站     │ Nginx HTTPS (Web+API+固件下载)    │"
     echo "  │ 80       │ 入站     │ HTTP→HTTPS 重定向                │"
     echo "  │ ${GW_PORT}   │ 入站     │ cmux网关 (TCP+TLS设备直连)        │"
     echo "  │ ${MQTT_PORT}    │ 入站     │ MQTT 设备直连                     │"
     echo "  │ ${MQTTS_PORT}    │ 入站     │ MQTTS/TLS 设备直连               │"
-    echo "  │ 1060     │ 入站     │ 遗留端口 (旧固件兼容)            │"
+    echo "  │ ${LEGACY_PORT}    │ 入站     │ 遗留端口 (旧固件兼容,可选)       │"
     echo "  │ 22       │ 入站     │ SSH 管理 (可限制IP)               │"
     echo "  └──────────┴──────────┴───────────────────────────────────┘"
     echo -e "  ${YELLOW}⚠️  10088/10089 无需外部开放 (仅 127.0.0.1 反代)${NC}"
