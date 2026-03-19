@@ -758,8 +758,8 @@ sudo firewall-cmd --reload
 
 ### C. 技术支持
 
-- **项目仓库**: https://github.com/hhtbing-wisefido/OTA-QL（私有）
-- **部署脚本下载**: https://github.com/hhtbing-wisefido/public-data/tree/main/OTA-QL-data
+- **项目仓库**: https://github.com/hhtbing/ota（私有）
+- **部署脚本下载**: https://github.com/hhtbing/public-data/tree/main/OTA-QL-data
 
 ---
 
