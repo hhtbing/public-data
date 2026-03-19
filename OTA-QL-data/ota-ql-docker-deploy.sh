@@ -37,7 +37,7 @@ BG_YELLOW='\033[43m'
 # ============================================================================
 # 配置变量
 # ============================================================================
-IMAGE_NAME="ghcr.io/hhtbing/ota:latest"
+IMAGE_NAME="ghcr.io/hhtbing/ota-ql:latest"
 CONTAINER_NAME="ota-ql"
 DATA_DIR="/opt/ota-ql"
 FIRMWARE_DIR="${DATA_DIR}/firmware"
