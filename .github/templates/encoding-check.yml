@@ -1,0 +1,122 @@
+# 文件：.github/workflows/encoding-check.yml
+# 将此文件复制到 .github/workflows/ 目录
+name: 🔍 Encoding Check
+on:
+  push:
+    branches: [ main, master, develop ]
+    paths:
+      - '**.html'
+      - '**.css'
+      - '**.js'
+      - '**.jsx'
+      - '**.ts'
+      - '**.tsx'
+      - '**.vue'
+      - '**.json'
+      - '**.md'
+      - '**.yml'
+      - '**.yaml'
+  pull_request:
+    branches: [ main, master ]
+jobs:
+  encoding-check:
+    name: 检查文件编码
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: 🔍 检查 UTF-8 编码
+        run: |
+          echo "=== 检查文件编码 ==="
+          python3 << 'EOF'
+          import os
+          import sys
+          errors = []
+          warnings = []
+          # 需要检查的文件扩展名
+          extensions = ('.html', '.css', '.js', '.jsx', '.ts', '.tsx', '.vue', '.json', '.md', '.yml', '.yaml')
+          # 排除的目录
+          exclude_dirs = {'node_modules', '.git', 'vendor', 'dist', 'build', '__pycache__'}
+          for root, dirs, files in os.walk('.'):
+              # 排除目录
+              dirs[:] = [d for d in dirs if d not in exclude_dirs]
+              for file in files:
+                  if file.endswith(extensions):
+                      filepath = os.path.join(root, file)
+                      try:
+                          # 检查 UTF-8 编码
+                          with open(filepath, 'r', encoding='utf-8') as f:
+                              content = f.read()
+                          # 检查 BOM
+                          with open(filepath, 'rb') as f:
+                              if f.read(3) == b'\xef\xbb\xbf':
+                                  warnings.append(f"⚠️ {filepath}: 包含 BOM 标记")
+                          # 检查 CRLF
+                          if '\r\n' in content:
+                              warnings.append(f"⚠️ {filepath}: 使用 CRLF 换行符")
+                      except UnicodeDecodeError as e:
+                          errors.append(f"❌ {filepath}: 编码错误 - {e}")
+          # 输出结果
+          if errors:
+              print("\n=== 编码错误 ===")
+              for err in errors:
+                  print(err)
+          if warnings:
+              print("\n=== 编码警告 ===")
+              for warn in warnings:
+                  print(warn)
+          if errors:
+              print(f"\n发现 {len(errors)} 个错误，{len(warnings)} 个警告")
+              sys.exit(1)
+          elif warnings:
+              print(f"\n发现 {len(warnings)} 个警告（非阻塞）")
+          else:
+              print("\n✅ 所有文件编码检查通过")
+          EOF
+      - name: 🔧 自动修复编码问题
+        if: failure()
+        run: |
+          echo "=== 尝试自动修复编码问题 ==="
+          python3 << 'EOF'
+          import os
+          extensions = ('.html', '.css', '.js', '.jsx', '.ts', '.tsx', '.vue', '.json', '.md', '.yml', '.yaml')
+          exclude_dirs = {'node_modules', '.git', 'vendor', 'dist', 'build'}
+          fixed_count = 0
+          for root, dirs, files in os.walk('.'):
+              dirs[:] = [d for d in dirs if d not in exclude_dirs]
+              for file in files:
+                  if file.endswith(extensions):
+                      filepath = os.path.join(root, file)
+                      try:
+                          with open(filepath, 'rb') as f:
+                              content = f.read()
+                          modified = False
+                          # 移除 BOM
+                          if content.startswith(b'\xef\xbb\xbf'):
+                              content = content[3:]
+                              modified = True
+                          # 转换 CRLF 为 LF
+                          if b'\r\n' in content:
+                              content = content.replace(b'\r\n', b'\n')
+                              modified = True
+                          if modified:
+                              with open(filepath, 'wb') as f:
+                                  f.write(content)
+                              print(f"✅ 已修复: {filepath}")
+                              fixed_count += 1
+                      except Exception as e:
+                          print(f"❌ 无法处理: {filepath} - {e}")
+          print(f"\n共修复 {fixed_count} 个文件")
+          EOF
+      - name: 📝 提交修复
+        if: failure()
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add -A
+          git diff --staged --quiet || git commit -m "chore: 自动修复编码问题 [skip ci]"
+          git push || echo "无需推送"

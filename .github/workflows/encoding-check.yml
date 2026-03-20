@@ -1,0 +1,68 @@
+name: 🔍 Encoding Check
+on:
+  push:
+    branches: [ main, master, develop, 'test/**' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+jobs:
+  encoding-check:
+    name: 检查文件编码
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: 🔍 检查 UTF-8 编码
+        run: |
+          echo "=== 检查文件编码 ==="
+          python3 << 'EOF'
+          import os
+          import sys
+          errors = []
+          warnings = []
+          # 需要检查的文件扩展名
+          extensions = ('.html', '.css', '.js', '.jsx', '.ts', '.tsx', '.vue', '.json', '.md', '.yml', '.yaml')
+          # 排除的目录
+          exclude_dirs = {'node_modules', '.git', 'vendor', 'dist', 'build', '__pycache__'}
+          for root, dirs, files in os.walk('.'):
+              # 排除目录
+              dirs[:] = [d for d in dirs if d not in exclude_dirs]
+              for file in files:
+                  if file.endswith(extensions):
+                      filepath = os.path.join(root, file)
+                      try:
+                          # 检查 UTF-8 编码
+                          with open(filepath, 'r', encoding='utf-8') as f:
+                              content = f.read()
+                          # 检查 BOM
+                          with open(filepath, 'rb') as f:
+                              if f.read(3) == b'\xef\xbb\xbf':
+                                  warnings.append(f"⚠️ {filepath}: 包含 BOM 标记")
+                          # 检查 CRLF
+                          if '\r\n' in content:
+                              warnings.append(f"⚠️ {filepath}: 使用 CRLF 换行符")
+                      except UnicodeDecodeError as e:
+                          errors.append(f"❌ {filepath}: 编码错误 - {e}")
+          # 输出结果
+          if errors:
+              print("\n=== 编码错误 ===")
+              for err in errors:
+                  print(err)
+          if warnings:
+              print("\n=== 编码警告 ===")
+              for warn in warnings:
+                  print(warn)
+          if errors:
+              print(f"\n发现 {len(errors)} 个错误，{len(warnings)} 个警告")
+              sys.exit(1)
+          elif warnings:
+              print(f"\n发现 {len(warnings)} 个警告（非阻塞）")
+          else:
+              print("\n✅ 所有文件编码检查通过")
+          EOF

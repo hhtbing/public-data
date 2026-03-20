@@ -194,38 +194,141 @@ show_deployed_cert_info() {
     echo "=========================================="
     echo ""
 
-    if [ -f "${CERTS_DIR}/fullchain.pem" ] && [ -f "${CERTS_DIR}/privkey.pem" ]; then
-        log_success "检测到证书文件"
-        echo "  证书路径: ${CERTS_DIR}/fullchain.pem"
-        echo "  私钥路径: ${CERTS_DIR}/privkey.pem"
-        echo ""
+    local candidates=()
 
-        # 显示证书详情
-        local cert_info=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -subject -issuer -dates 2>/dev/null)
+    # 首先检查统一路径
+    if [ -f "${CERTS_DIR}/fullchain.pem" ] && [ -f "${CERTS_DIR}/privkey.pem" ]; then
+        candidates+=("${CERTS_DIR}/fullchain.pem|${CERTS_DIR}/privkey.pem|本地目录")
+    fi
+
+    # 检查定义的面板路径
+    for path_entry in "${CERT_SEARCH_PATHS[@]}"; do
+        local cert_path=$(echo "$path_entry" | cut -d'|' -f2)
+        local key_path=$(echo "$path_entry" | cut -d'|' -f3)
+        if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+            local panel=$(echo "$path_entry" | cut -d'|' -f1)
+            candidates+=("$cert_path|$key_path|$panel")
+        fi
+    done
+
+    # 兼容路径额外搜索
+    local extra_paths=(
+        "/etc/letsencrypt/live/*/fullchain.pem"
+        "/root/.acme.sh/*/fullchain.cer"
+        "/www/server/panel/vhost/cert/*/fullchain.pem"
+        "/www/server/panel/vhost/ssl/*/fullchain.pem"
+        "/etc/nginx/ssl/*/fullchain.pem"
+        "/etc/apache2/ssl/*/fullchain.pem"
+        "/etc/httpd/ssl/*/fullchain.pem"
+        "/var/lib/caddy/.local/share/caddy/certificates/*/*/*.crt"
+    )
+
+    for pattern in "${extra_paths[@]}"; do
+        for cert_file in $(find $pattern 2>/dev/null); do
+            local key_file=""
+            if [ "${cert_file##*.}" = "pem" ]; then
+                key_file=$(echo "$cert_file" | sed 's/fullchain\.pem/privkey\.pem/')
+            elif [ "${cert_file##*.}" = "cer" ]; then
+                local domain=$(basename "$(dirname "$cert_file")")
+                key_file=$(dirname "$cert_file")"/${domain}.key
+            elif [ "${cert_file##*.}" = "crt" ]; then
+                key_file="${cert_file%.crt}.key"
+            fi
+
+            if [ -n "${key_file}" ] && [ -f "$key_file" ]; then
+                candidates+=("$cert_file|$key_file|自动搜索")
+            fi
+        done
+    done
+
+    if [ ${#candidates[@]} -eq 0 ]; then
+        log_warning "未找到已部署证书，请先部署或手动指定路径"
+        echo "  默认证书目录: ${CERTS_DIR}"
+        echo "  你可以使用 SSL证书管理 -> 全局搜索系统证书 -> 手动指定路径"
+        echo ""
+        return 1
+    fi
+
+    log_success "找到 ${#candidates[@]} 个候选证书"
+
+    local idx=0
+    for item in "${candidates[@]}"; do
+        idx=$((idx+1))
+        local cert_path=$(echo "$item" | cut -d'|' -f1)
+        local key_path=$(echo "$item" | cut -d'|' -f2)
+        local src=$(echo "$item" | cut -d'|' -f3)
+        echo "  [$idx] 源: $src"
+        echo "      证书: $cert_path"
+        echo "      私钥: $key_path"
+    done
+
+    if [ ${#candidates[@]} -gt 1 ]; then
+        read -ep "请选择要展示详细状态的证书 (1-${#candidates[@]}, 0 取消, 默认1): " sel
+        if [ -z "$sel" ]; then
+            sel=1
+        fi
+        if [ "$sel" = "0" ]; then
+            echo "已取消"
+            echo ""
+            return 0
+        fi
+        if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#candidates[@]} ]; then
+            log_warning "选择无效，默认取第1个"
+            sel=1
+        fi
+    else
+        sel=1
+    fi
+
+    local choice=${candidates[$((sel-1))]}
+    local chosen_cert=$(echo "$choice" | cut -d'|' -f1)
+    local chosen_key=$(echo "$choice" | cut -d'|' -f2)
+
+    echo ""
+    echo "正在展示: $chosen_cert"
+    echo ""
+
+    log_success "已选证书：$chosen_cert"
+    log_success "对应私钥：$chosen_key"
+
+    if [ -f "$chosen_cert" ]; then
+        local cert_info=$(openssl x509 -in "$chosen_cert" -noout -subject -issuer -dates -serial -sha256 -fingerprint 2>/dev/null)
         if [ $? -eq 0 ]; then
-            echo "证书详情:"
+            echo "证书详细信息:"
             echo "  ────────────────────────────────────"
-            echo "${cert_info}" | sed 's/^/  /'
+            echo "$cert_info" | sed 's/^/  /'
             echo ""
 
-            # 检查证书有效期
-            local expire_date=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d'=' -f2)
+            local expire_date=$(openssl x509 -in "$chosen_cert" -noout -enddate 2>/dev/null | cut -d'=' -f2)
             local expire_seconds=$(date -d "$expire_date" +%s 2>/dev/null)
             local now_seconds=$(date +%s)
             local days_left=$(( (expire_seconds - now_seconds) / 86400 ))
 
-            if [ $days_left -gt 30 ]; then
-                echo -e "  ${GREEN}✓${NC} 有效期: $days_left 天"
-            elif [ $days_left -gt 7 ]; then
-                echo -e "  ${YELLOW}!${NC} 有效期: $days_left 天 (即将过期)"
+            if [ "$expire_seconds" -gt 0 ]; then
+                if [ $days_left -gt 30 ]; then
+                    echo -e "  ${GREEN}✓${NC} 有效期: $days_left 天"
+                elif [ $days_left -gt 7 ]; then
+                    echo -e "  ${YELLOW}!${NC} 有效期: $days_left 天 (即将过期)"
+                else
+                    echo -e "  ${RED}✗${NC} 有效期: $days_left 天 (紧急过期)"
+                fi
             else
-                echo -e "  ${RED}✗${NC} 有效期: $days_left 天 (紧急过期)"
+                echo "  ${RED}✗${NC} 无法解析有效期";
             fi
+
+            echo "  证书路径: $chosen_cert"
+            echo "  私钥路径: $chosen_key"
+            echo ""
+            echo "  部署提示：可将此证书复制到 ${CERTS_DIR}/fullchain.pem 和 ${CERTS_DIR}/privkey.pem";
+            echo "  示例: sudo cp -f $chosen_cert ${CERTS_DIR}/fullchain.pem && sudo cp -f $chosen_key ${CERTS_DIR}/privkey.pem"
+            echo "  并设置 chmod 644/600"
+        else
+            log_warning "无法读取证书详情，请确认 openssl 是否可用及证书有效"
         fi
     else
-        log_warning "未检测到证书文件"
-        echo "  证书目录: ${CERTS_DIR}"
+        log_error "所选证书文件不存在: $chosen_cert"
     fi
+
     echo ""
 }
 

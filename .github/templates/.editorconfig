@@ -1,0 +1,37 @@
+# EditorConfig - 统一编辑器配置
+# https://editorconfig.org
+# 将此文件复制到项目根目录
+root = true
+
+# 所有文件的默认设置
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# HTML, CSS, JS, JSON, YAML 使用 2 空格缩进
+[*.{html,css,js,jsx,ts,tsx,json,yml,yaml,vue}]
+indent_size = 2
+
+# Markdown 保留尾部空格（用于换行）
+[*.md]
+trim_trailing_whitespace = false
+
+# Makefile 必须使用 Tab
+[Makefile]
+indent_style = tab
+
+# Shell 脚本
+[*.sh]
+end_of_line = lf
+
+# Windows 批处理（保持 CRLF）
+[*.{cmd,bat}]
+end_of_line = crlf
+
+# PowerShell 脚本
+[*.ps1]
+end_of_line = crlf

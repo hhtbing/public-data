@@ -1,0 +1,75 @@
+# Git 文件属性配置
+# 确保跨平台协作时编码一致
+# 将此文件复制到项目根目录
+
+# 默认自动检测文本文件并统一换行符
+* text=auto eol=lf
+
+# === 明确指定文本文件类型 ===
+# Web 文件
+*.html text eol=lf
+*.css  text eol=lf
+*.js   text eol=lf
+*.jsx  text eol=lf
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.vue  text eol=lf
+*.json text eol=lf
+
+# 配置文件
+*.yml        text eol=lf
+*.yaml       text eol=lf
+*.xml        text eol=lf
+*.toml       text eol=lf
+*.ini        text eol=lf
+*.cfg        text eol=lf
+*.conf       text eol=lf
+.editorconfig text eol=lf
+.gitattributes text eol=lf
+.gitignore   text eol=lf
+
+# 文档文件
+*.md  text eol=lf
+*.txt text eol=lf
+*.rst text eol=lf
+
+# 脚本文件
+*.sh   text eol=lf
+*.bash text eol=lf
+*.zsh  text eol=lf
+*.py   text eol=lf
+*.rb   text eol=lf
+*.pl   text eol=lf
+
+# Windows 脚本（保持 CRLF）
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# === 二进制文件（不处理换行符）===
+# 图片
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.svg  text eol=lf
+
+# 字体
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.eot   binary
+*.otf   binary
+
+# 其他二进制
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary
+*.7z   binary
+*.exe  binary
+*.dll  binary
+*.so   binary
+*.dylib binary
