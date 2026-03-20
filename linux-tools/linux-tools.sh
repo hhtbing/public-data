@@ -72,9 +72,14 @@ CERT_SEARCH_PATHS=(
 # ============================================================================
 # 日志函数
 # ============================================================================
-log_info()     { echo -e "${BLUE}[INFO]${NC} $1"; }log_success()  { echo -e "${GREEN}[SUCCESS]${NC} $1"; }log_warning()  { echo -e "${YELLOW}[WARNING]${NC} $1"; }log_error()    { echo -e "${RED}[ERROR]${NC} $1"; }log_highlight(){ echo -e "${CYAN}$1${NC}"; }
+log_info()      { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success()   { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning()   { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error()     { echo -e "${RED}[ERROR]${NC} $1"; }
+log_highlight() { echo -e "${CYAN}$1${NC}"; }
 
-# 检查当前权限check_permission() {
+# 检查当前权限
+check_permission() {
     if [ "$(id -u)" -eq 0 ]; then
         HAS_ROOT=true
         log_success "当前用户: root (管理员权限)"
@@ -84,7 +89,8 @@ log_info()     { echo -e "${BLUE}[INFO]${NC} $1"; }log_success()  { echo -e "${G
     fi
 }
 
-# 切换到root权限switch_to_root() {
+# 切换到root权限
+switch_to_root() {
     if [ "$HAS_ROOT" = true ]; then
         log_warning "已经是管理员权限，无需切换"
         return 0
@@ -458,7 +464,7 @@ install_letsencrypt_client() {
 }
 
 # 跨域名证书部署
- deploy_cross_domain_cert() {
+deploy_cross_domain_cert() {
     echo ""
     echo "=========================================="
     echo "  🌐 跨域名证书部署"
@@ -756,104 +762,73 @@ query_renew_status() {
 
 # 菜单: SSL证书管理
 menu_cert_management() {
-    echo ""
-    echo "=========================================="
-    echo "  🔒 SSL 证书管理 (Let's Encrypt)"
-    echo "=========================================="
-    echo ""
-
-    echo "  1. 查看当前证书状态 - 显示已部署证书的详细信息"
-    echo "  2. 按域名搜索并部署证书 - 搜索特定域名的证书并部署"
-    echo "  3. 全局搜索系统中所有证书 - 查找系统中所有可用证书"
-    echo "  4. 手动指定证书路径 - 手动选择证书文件进行部署"
-    echo "  5. 跨域名证书部署 - 部署包含多个域名的证书"
-    echo "  6. 查询证书覆盖情况 - 检查多个域名的证书覆盖状态"
-    echo "  7. 交互式申请SAN证书 - 申请包含多个域名的SAN证书"
-    echo "  8. 交互式申请通配符证书 - 申请保护所有子域名的证书"
-    echo "  9. 域名证书自动延期 - 设置证书自动延期服务"
-    echo " 10. 域名证书手动延期 - 手动延期指定域名的证书"
-    echo " 11. 查询证书延期状态 - 查看所有证书的延期状态"
-    echo " 0. 返回主菜单"
-    echo ""
-    read -ep "请选择 [0-11]: " cert_choice
-
-    case $cert_choice in
-        1)
-            show_deployed_cert_info
-            ;;
-        2)
-            read -ep "请输入域名: " domain
-            if [ -n "$domain" ]; then
-                search_certs_for_domain "$domain"
-
-                if [ ${#FOUND_CERTS[@]} -gt 0 ]; then
-                    echo "选择要部署的证书:"
-                    local idx=0
-                    for entry in "${FOUND_CERTS[@]}"; do
-                        idx=$((idx + 1))
-                        local pname=$(echo "$entry" | cut -d'|' -f1)
-                        local cpath=$(echo "$entry" | cut -d'|' -f2)
-                        echo "  [$idx] ${pname} — ${cpath}"
-                    done
-                    echo "  [0] 取消"
-                    echo ""
-                    read -ep "请选择 [0-${idx}]: " sel
-
-                    if [ "$sel" -ge 1 ] 2>/dev/null && [ "$sel" -le $idx ] 2>/dev/null; then
-                        local chosen="${FOUND_CERTS[$((sel-1))]}"
-                        local ch_cert=$(echo "$chosen" | cut -d'|' -f2)
-                        local ch_key=$(echo "$chosen" | cut -d'|' -f3)
-
-                        # 复制证书到统一目录
-                        cp -f "$ch_cert" "${CERTS_DIR}/fullchain.pem"
-                        cp -f "$ch_key" "${CERTS_DIR}/privkey.pem"
-
-                        chmod 600 "${CERTS_DIR}/privkey.pem"
-                        chmod 644 "${CERTS_DIR}/fullchain.pem"
-
-                        log_success "证书部署成功！"
-                        show_deployed_cert_info
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "  🔒 SSL证书管理 (Let's Encrypt/多面板通用)"
+        echo "=========================================="
+        echo "  1. 查看当前证书状态（显示已部署证书详细信息，自动适配多面板路径）"
+        echo "  2. 按域名搜索并部署证书（输入域名，自动查找并可一键部署）"
+        echo "  3. 全局搜索系统中所有证书（自动遍历常见面板和路径）"
+        echo "  4. 手动指定证书路径（输入证书和私钥路径，校验并部署）"
+        echo "  5. 跨域名证书部署（支持多个域名一键申请和部署）"
+        echo "  6. 查询证书覆盖情况（批量输入域名，检查哪些已覆盖）"
+        echo "  7. 交互式申请SAN证书（多域名证书，交互输入）"
+        echo "  8. 交互式申请通配符证书（如*.example.com，需DNS验证）"
+        echo "  9. 域名证书自动延期（自动续期，支持certbot/acme.sh）"
+        echo " 10. 域名证书手动延期（手动续期指定域名）"
+        echo " 11. 查询证书延期状态（查看所有证书续期状态）"
+        echo "  0. 返回主菜单"
+        echo "  输入 b 或 返回 可随时回退主菜单。"
+        read -ep "请选择 [0-11]，或输入b/返回: " cert_choice
+        case "$cert_choice" in
+            1) show_deployed_cert_info ;;
+            2)
+                read -ep "请输入域名（或b返回）: " domain
+                [ "$domain" = "b" ] || [ "$domain" = "返回" ] && return 0
+                if [ -n "$domain" ]; then
+                    search_certs_for_domain "$domain"
+                    if [ ${#FOUND_CERTS[@]} -gt 0 ]; then
+                        echo "选择要部署的证书:"
+                        local idx=0
+                        for entry in "${FOUND_CERTS[@]}"; do
+                            idx=$((idx + 1))
+                            local pname=$(echo "$entry" | cut -d'|' -f1)
+                            local cpath=$(echo "$entry" | cut -d'|' -f2)
+                            echo "  [$idx] ${pname} — ${cpath}"
+                        done
+                        echo "  [0] 取消"
+                        read -ep "请选择 [0-${idx}]: " sel
+                        [ "$sel" = "b" ] || [ "$sel" = "返回" ] && return 0
+                        if [ "$sel" -ge 1 ] 2>/dev/null && [ "$sel" -le $idx ] 2>/dev/null; then
+                            local chosen="${FOUND_CERTS[$((sel-1))]}"
+                            local ch_cert=$(echo "$chosen" | cut -d'|' -f2)
+                            local ch_key=$(echo "$chosen" | cut -d'|' -f3)
+                            cp -f "$ch_cert" "${CERTS_DIR}/fullchain.pem"
+                            cp -f "$ch_key" "${CERTS_DIR}/privkey.pem"
+                            chmod 600 "${CERTS_DIR}/privkey.pem"
+                            chmod 644 "${CERTS_DIR}/fullchain.pem"
+                            log_success "证书部署成功！"
+                            show_deployed_cert_info
+                        fi
                     fi
+                else
+                    log_warning "未输入域名"
                 fi
-            else
-                log_warning "未输入域名"
-            fi
-            ;;
-        3)
-            global_search_certs
-            ;;
-        4)
-            manual_deploy_cert
-            ;;
-        5)
-            deploy_cross_domain_cert
-            ;;
-        6)
-            query_cert_coverage
-            ;;
-        7)
-            apply_san_cert
-            ;;
-        8)
-            apply_wildcard_cert
-            ;;
-        9)
-            auto_renew_cert
-            ;;
-        10)
-            manual_renew_cert
-            ;;
-        11)
-            query_renew_status
-            ;;
-        0)
-            return 0
-            ;;
-        *)
-            log_warning "无效选择，请输入 0-11"
-            sleep 1
-            ;;
-    esac
+                ;;
+            3) global_search_certs ;;
+            4) manual_deploy_cert ;;
+            5) deploy_cross_domain_cert ;;
+            6) query_cert_coverage ;;
+            7) apply_san_cert ;;
+            8) apply_wildcard_cert ;;
+            9) auto_renew_cert ;;
+            10) manual_renew_cert ;;
+            11) query_renew_status ;;
+            0|b|返回) return 0 ;;
+            *) log_warning "无效选择，请输入 0-11 或 b/返回"; sleep 1 ;;
+        esac
+    done
 }
 
 # ============================================================================
@@ -861,67 +836,35 @@ menu_cert_management() {
 # ============================================================================
 
 network_tools() {
-    echo ""
-    echo "=========================================="
-    echo "  📡 网络工具"
-    echo "=========================================="
-    echo ""
-
-    echo "  1. 网络连接状态"
-    echo "  2. 端口占用情况"
-    echo "  3. Ping 测试"
-    echo "  4. 路由表查看"
-    echo "  0. 返回主菜单"
-    echo ""
-    read -ep "请选择 [0-4]: " net_choice
-
-    case $net_choice in
-        1)
-            echo ""
-            echo "网络连接状态:"
-            echo "────────────────────────────────────"
-            ss -tuln | head -20
-            echo ""
-            ;;
-        2)
-            read -ep "请输入端口号 (空查看所有): " port
-            echo ""
-            echo "端口占用情况:"
-            echo "────────────────────────────────────"
-            if [ -n "$port" ]; then
-                ss -tuln | grep ":$port\b"
-            else
-                ss -tuln
-            fi
-            echo ""
-            ;;
-        3)
-            read -ep "请输入目标地址: " target
-            if [ -n "$target" ]; then
-                echo ""
-                echo "Ping 测试结果:"
-                echo "────────────────────────────────────"
-                ping -c 5 "$target"
-                echo ""
-            else
-                log_warning "未输入目标地址"
-            fi
-            ;;
-        4)
-            echo ""
-            echo "路由表:"
-            echo "────────────────────────────────────"
-            ip route
-            echo ""
-            ;;
-        0)
-            return 0
-            ;;
-        *)
-            log_warning "无效选择，请输入 0-4"
-            sleep 1
-            ;;
-    esac
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "  📡 网络工具"
+        echo "=========================================="
+        echo "  1. 网络连接状态（显示当前主机所有监听端口和连接）"
+        echo "  2. 端口占用情况（可查进程并交互杀进程，支持倒计时和二次确认）"
+        echo "  3. Ping 测试（输入目标IP或域名，测试连通性）"
+        echo "  4. 路由表查看（显示主机路由表）"
+        echo "  0. 返回主菜单"
+        echo "  输入 b 或 返回 可随时回退主菜单。"
+        read -ep "请选择 [0-4]，或输入b/返回: " net_choice
+        case "$net_choice" in
+            1) echo "\n网络连接状态:"; ss -tuln | head -20; echo "" ;;
+            2) show_port_usage ;;
+            3)
+                read -ep "请输入目标地址（或b返回）: " target
+                [ "$target" = "b" ] || [ "$target" = "返回" ] && return 0
+                if [ -n "$target" ]; then
+                    echo "\nPing 测试结果:"; ping -c 5 "$target"; echo ""
+                else
+                    log_warning "未输入目标地址"
+                fi
+                ;;
+            4) echo "\n路由表:"; ip route; echo "" ;;
+            0|b|返回) return 0 ;;
+            *) log_warning "无效选择，请输入 0-4 或 b/返回"; sleep 1 ;;
+        esac
+    done
 }
 
 # ============================================================================
@@ -929,57 +872,27 @@ network_tools() {
 # ============================================================================
 
 system_tools() {
-    echo ""
-    echo "=========================================="
-    echo "  🛠️  系统工具"
-    echo "=========================================="
-    echo ""
-
-    echo "  1. 系统资源监控"
-    echo "  2. 进程管理"
-    echo "  3. 磁盘空间分析"
-    echo "  4. 系统日志查看"
-    echo "  0. 返回主菜单"
-    echo ""
-    read -ep "请选择 [0-4]: " sys_choice
-
-    case $sys_choice in
-        1)
-            echo ""
-            echo "系统资源监控 (按 q 退出):"
-            echo "────────────────────────────────────"
-            top -b -n 1 | head -20
-            echo ""
-            ;;
-        2)
-            echo ""
-            echo "进程列表 (前20个):"
-            echo "────────────────────────────────────"
-            ps aux --sort=-%cpu | head -21
-            echo ""
-            ;;
-        3)
-            echo ""
-            echo "磁盘空间分析:"
-            echo "────────────────────────────────────"
-            du -h --max-depth=1 / | sort -rh | head -20
-            echo ""
-            ;;
-        4)
-            echo ""
-            echo "系统日志 (最新50行):"
-            echo "────────────────────────────────────"
-            journalctl -n 50
-            echo ""
-            ;;
-        0)
-            return 0
-            ;;
-        *)
-            log_warning "无效选择，请输入 0-4"
-            sleep 1
-            ;;
-    esac
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "  🛠️  系统工具"
+        echo "=========================================="
+        echo "  1. 系统资源监控（top命令，显示CPU/内存/负载等）"
+        echo "  2. 进程管理（按CPU排序，显示前20个进程）"
+        echo "  3. 磁盘空间分析（根目录各子目录空间占用）"
+        echo "  4. 系统日志查看（最新50行日志）"
+        echo "  0. 返回主菜单"
+        echo "  输入 b 或 返回 可随时回退主菜单。"
+        read -ep "请选择 [0-4]，或输入b/返回: " sys_choice
+        case "$sys_choice" in
+            1) echo "\n系统资源监控:"; top -b -n 1 | head -20; echo "" ;;
+            2) echo "\n进程列表(前20):"; ps aux --sort=-%cpu | head -21; echo "" ;;
+            3) echo "\n磁盘空间分析:"; du -h --max-depth=1 / | sort -rh | head -20; echo "" ;;
+            4) echo "\n系统日志(最新50行):"; journalctl -n 50; echo "" ;;
+            0|b|返回) return 0 ;;
+            *) log_warning "无效选择，请输入 0-4 或 b/返回"; sleep 1 ;;
+        esac
+    done
 }
 
 # ============================================================================
@@ -987,71 +900,50 @@ system_tools() {
 # ============================================================================
 
 file_tools() {
-    echo ""
-    echo "=========================================="
-    echo "  📁 文件管理"
-    echo "=========================================="
-    echo ""
-
-    echo "  1. 文件搜索"
-    echo "  2. 文本内容搜索"
-    echo "  3. 文件权限管理"
-    echo "  4. 文件大小统计"
-    echo "  0. 返回主菜单"
-    echo ""
-    read -ep "请选择 [0-4]: " file_choice
-
-    case $file_choice in
-        1)
-            read -ep "请输入文件名搜索模式: " pattern
-            read -ep "请输入搜索目录 (默认当前目录): " dir
-            [ -z "$dir" ] && dir="."
-            echo ""
-            echo "搜索结果:"
-            echo "────────────────────────────────────"
-            find "$dir" -name "$pattern" 2>/dev/null | head -20
-            echo ""
-            ;;
-        2)
-            read -ep "请输入要搜索的文本: " text
-            read -ep "请输入搜索目录 (默认当前目录): " dir
-            [ -z "$dir" ] && dir="."
-            echo ""
-            echo "搜索结果:"
-            echo "────────────────────────────────────"
-            grep -r "$text" "$dir" 2>/dev/null | head -20
-            echo ""
-            ;;
-        3)
-            read -ep "请输入文件路径: " file
-            if [ -f "$file" ]; then
-                echo ""
-                echo "当前权限: $(stat -c "%a %A" "$file")"
-                read -ep "请输入新权限 (如 644): " perm
-                chmod "$perm" "$file"
-                log_success "权限已修改为 $perm"
-                echo ""
-            else
-                log_error "文件不存在: $file"
-            fi
-            ;;
-        4)
-            read -ep "请输入目录路径 (默认当前目录): " dir
-            [ -z "$dir" ] && dir="."
-            echo ""
-            echo "文件大小统计:"
-            echo "────────────────────────────────────"
-            du -ah "$dir" | sort -rh | head -20
-            echo ""
-            ;;
-        0)
-            return 0
-            ;;
-        *)
-            log_warning "无效选择，请输入 0-4"
-            sleep 1
-            ;;
-    esac
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "  📁 文件管理"
+        echo "=========================================="
+        echo "  1. 文件搜索（支持通配符，指定目录）"
+        echo "  2. 文本内容搜索（递归查找目录下所有文件内容）"
+        echo "  3. 文件权限管理（显示并修改文件权限）"
+        echo "  4. 文件大小统计（目录下文件/子目录大小排序）"
+        echo "  0. 返回主菜单"
+        echo "  输入 b 或 返回 可随时回退主菜单。"
+        read -ep "请选择 [0-4]，或输入b/返回: " file_choice
+        case "$file_choice" in
+            1)
+                read -ep "请输入文件名搜索模式（如 *.log，或b返回）: " pattern
+                [ "$pattern" = "b" ] || [ "$pattern" = "返回" ] && return 0
+                read -ep "请输入搜索目录 (默认当前目录): " dir
+                [ -z "$dir" ] && dir="."
+                echo "\n搜索结果:"; find "$dir" -name "$pattern" 2>/dev/null | head -20; echo "" ;;
+            2)
+                read -ep "请输入要搜索的文本（或b返回）: " text
+                [ "$text" = "b" ] || [ "$text" = "返回" ] && return 0
+                read -ep "请输入搜索目录 (默认当前目录): " dir
+                [ -z "$dir" ] && dir="."
+                echo "\n搜索结果:"; grep -r "$text" "$dir" 2>/dev/null | head -20; echo "" ;;
+            3)
+                read -ep "请输入文件路径（或b返回）: " file
+                [ "$file" = "b" ] || [ "$file" = "返回" ] && return 0
+                if [ -f "$file" ]; then
+                    echo "当前权限: $(stat -c '%a %A' "$file")"
+                    read -ep "请输入新权限 (如 644): " perm
+                    chmod "$perm" "$file" && log_success "权限已修改为 $perm"
+                else
+                    log_error "文件不存在: $file"
+                fi
+                echo "" ;;
+            4)
+                read -ep "请输入目录路径 (默认当前目录): " dir
+                [ -z "$dir" ] && dir="."
+                echo "\n文件大小统计:"; du -ah "$dir" | sort -rh | head -20; echo "" ;;
+            0|b|返回) return 0 ;;
+            *) log_warning "无效选择，请输入 0-4 或 b/返回"; sleep 1 ;;
+        esac
+    done
 }
 
 # ============================================================================
@@ -1089,45 +981,29 @@ get_available_interfaces() {
 
 # 抓包管理主菜单
 capture_management() {
-    echo ""
-    echo "=========================================="
-    echo "  🕵️  抓包管理"
-    echo "=========================================="
-    echo ""
-
-    echo "  1. 开始抓包"
-    echo "  2. 分析已保存的包"
-    echo "  3. 导入包文件"
-    echo "  4. 导出包文件"
-    echo "  5. 抓包工具设置"
-    echo "  0. 返回主菜单"
-    echo ""
-    read -ep "请选择 [0-5]: " capture_choice
-
-    case $capture_choice in
-        1)
-            start_capture
-            ;;
-        2)
-            analyze_capture
-            ;;
-        3)
-            import_capture
-            ;;
-        4)
-            export_capture
-            ;;
-        5)
-            capture_settings
-            ;;
-        0)
-            return 0
-            ;;
-        *)
-            log_warning "无效选择，请输入 0-5"
-            sleep 1
-            ;;
-    esac
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "  🕵️  抓包管理"
+        echo "=========================================="
+        echo "  1. 开始抓包（选择网口、工具、过滤条件、保存文件名）"
+        echo "  2. 分析已保存的包（统计、内容、协议过滤、关键词搜索）"
+        echo "  3. 导入包文件（支持pcap/pcapng）"
+        echo "  4. 导出包文件（导出到指定路径）"
+        echo "  5. 抓包工具设置（检测/安装tcpdump、tshark等）"
+        echo "  0. 返回主菜单"
+        echo "  输入 b 或 返回 可随时回退主菜单。"
+        read -ep "请选择 [0-5]，或输入b/返回: " capture_choice
+        case "$capture_choice" in
+            1) start_capture ;;
+            2) analyze_capture ;;
+            3) import_capture ;;
+            4) export_capture ;;
+            5) capture_settings ;;
+            0|b|返回) return 0 ;;
+            *) log_warning "无效选择，请输入 0-5 或 b/返回"; sleep 1 ;;
+        esac
+    done
 }
 
 # 开始抓包
@@ -1460,99 +1336,59 @@ capture_settings() {
 
 # 权限管理菜单
 permission_management() {
-    echo ""
-    echo "=========================================="
-    echo "  🔑 权限管理"
-    echo "=========================================="
-    echo ""
-    echo "当前权限状态:"
-    if [ "$HAS_ROOT" = true ]; then
-        echo -e "  ${GREEN}✓ 管理员权限 (root)${NC}"
-    else
-        echo -e "  ${YELLOW}⚠ 普通用户权限${NC}"
-    fi
-    echo ""
-    echo "  1. 切换到管理员权限 (sudo)"
-    echo "  2. 切换回普通用户权限"
-    echo "  0. 返回主菜单"
-    echo ""
-    read -ep "请选择 [0-2]: " perm_choice
-
-    case $perm_choice in
-        1)
-            switch_to_root "$@"
-            ;;
-        2)
-            switch_to_user "$@"
-            ;;
-        0)
-            return 0
-            ;;
-        *)
-            log_warning "无效选择，请输入 0-2"
-            sleep 1
-            ;;
-    esac
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "  🔑 权限管理"
+        echo "=========================================="
+        echo "  当前权限状态:"
+        if [ "$HAS_ROOT" = true ]; then
+            echo -e "  ${GREEN}✓ 管理员权限 (root)${NC}"
+        else
+            echo -e "  ${YELLOW}⚠ 普通用户权限${NC}"
+        fi
+        echo "  1. 切换到管理员权限 (sudo)"
+        echo "  2. 切换回普通用户权限"
+        echo "  0. 返回主菜单"
+        echo "  输入 b 或 返回 可随时回退主菜单。"
+        read -ep "请选择 [0-2]，或输入b/返回: " perm_choice
+        case "$perm_choice" in
+            1) switch_to_root "$@" ;;
+            2) switch_to_user "$@" ;;
+            0|b|返回) return 0 ;;
+            *) log_warning "无效选择，请输入 0-2 或 b/返回"; sleep 1 ;;
+        esac
+    done
 }
 
 interactive_menu() {
     trap 'echo ""; log_info "返回主菜单..."; echo ""' SIGINT
-
     while true; do
         echo ""
         echo "=========================================="
         echo "  🚀 通用Linux自动化工具集 (v2.0)"
         echo "=========================================="
+        echo "  请选择要执行的功能，输入对应数字，或输入 b/返回 回退退出。"
+        echo "  1. 查询系统信息（显示主机、CPU、内存、磁盘、网络等详细信息）"
+        echo "  2. SSL证书管理（适配多面板，支持部署、续期、SAN、通配符等）"
+        echo "  3. 网络工具（端口占用、进程管理、路由、Ping等，支持交互杀进程）"
+        echo "  4. 系统工具（资源监控、进程、磁盘、日志等）"
+        echo "  5. 文件管理（文件搜索、内容查找、权限、统计等）"
+        echo "  6. 抓包管理（网口选择、关键词过滤、导入导出、分析等）"
+        echo "  7. 权限管理（sudo/root切换，安全提示）"
+        echo "  0. 退出"
         echo ""
-        echo -e "  ${GREEN}1.${NC}  🖥️  查询系统信息 - 查看系统详细配置信息"
-        echo -e "  ${GREEN}2.${NC}  🔒 SSL证书管理 - 管理Let's Encrypt SSL证书"
-        echo -e "  ${GREEN}3.${NC}  📡 网络工具 - 网络连接、端口、路由管理"
-        echo -e "  ${GREEN}4.${NC}  🛠️  系统工具 - 系统资源、进程、日志管理"
-        echo -e "  ${GREEN}5.${NC}  📁 文件管理 - 文件搜索、内容查询、权限管理"
-        echo -e "  ${GREEN}6.${NC}  🕵️  抓包管理 - 网络数据包捕获与分析"
-        echo -e "  ${GREEN}7.${NC}  🔑 权限管理 - 切换用户权限"
-        echo "  0. 🚪 退出 - 退出工具"
-        echo ""
-        read -ep "请选择操作 [0-7]: " choice
-
-        case $choice in
-            1)
-                query_system_info
-                read -ep "按Enter键返回菜单..." dummy
-                ;;
-            2)
-                menu_cert_management
-                read -ep "按Enter键返回菜单..." dummy
-                ;;
-            3)
-                network_tools
-                read -ep "按Enter键返回菜单..." dummy
-                ;;
-            4)
-                system_tools
-                read -ep "按Enter键返回菜单..." dummy
-                ;;
-            5)
-                file_tools
-                read -ep "按Enter键返回菜单..." dummy
-                ;;
-            6)
-                capture_management
-                read -ep "按Enter键返回菜单..." dummy
-                ;;
-            7)
-                permission_management "$@"
-                ;;
-            0)
-                echo ""
-                log_info "感谢使用通用Linux自动化工具集"
-                echo ""
-                exit 0
-                ;;
-            *)
-                log_warning "无效选择，请输入 0-7"
-                sleep 1
-                ;;
+        read -ep "请输入功能编号 [0-7]，或输入 b/返回: " choice
+        case "$choice" in
+            1) query_system_info; read -ep "按Enter键返回主菜单..." dummy ;;
+            2) menu_cert_management; read -ep "按Enter键返回主菜单..." dummy ;;
+            3) network_tools; read -ep "按Enter键返回菜单..." dummy ;;
+            4) system_tools; read -ep "按Enter键返回菜单..." dummy ;;
+            5) file_tools; read -ep "按Enter键返回菜单..." dummy ;;
+            6) capture_management; read -ep "按Enter键返回菜单..." dummy ;;
+            7) permission_management "$@" ;;
+            0|b|返回) echo ""; log_info "感谢使用通用Linux自动化工具集"; echo ""; exit 0 ;;
+            *) log_warning "无效选择，请输入 0-7 或 b/返回"; sleep 1 ;;
         esac
     done
 }
