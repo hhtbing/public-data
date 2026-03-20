@@ -103,7 +103,8 @@ log_info()     { echo -e "${BLUE}[INFO]${NC} $1"; }log_success()  { echo -e "${G
     fi
 }
 
-# 切换回普通用户权限switch_to_user() {
+# 切换回普通用户权限
+switch_to_user() {
     if [ "$HAS_ROOT" = false ]; then
         log_warning "已经是普通用户权限，无需切换"
         return 0
@@ -392,7 +393,8 @@ show_cert_guide() {
     echo ""
 }
 
-# 检查Let's Encrypt客户端是否安装check_letsencrypt_client() {
+# 检查Let's Encrypt客户端是否安装
+check_letsencrypt_client() {
     if command -v certbot &>/dev/null; then
         echo "certbot"
         return 0
@@ -405,7 +407,8 @@ show_cert_guide() {
     fi
 }
 
-# 安装Let's Encrypt客户端install_letsencrypt_client() {
+# 安装Let's Encrypt客户端
+install_letsencrypt_client() {
     local client_choice
 
     echo ""
@@ -454,7 +457,8 @@ show_cert_guide() {
     fi
 }
 
-# 跨域名证书部署deploy_cross_domain_cert() {
+# 跨域名证书部署
+ deploy_cross_domain_cert() {
     echo ""
     echo "=========================================="
     echo "  🌐 跨域名证书部署"
@@ -504,7 +508,8 @@ show_cert_guide() {
     fi
 }
 
-# 查询证书覆盖情况query_cert_coverage() {
+# 查询证书覆盖情况
+query_cert_coverage() {
     echo ""
     echo "=========================================="
     echo "  📋 证书覆盖情况查询"
@@ -541,7 +546,8 @@ show_cert_guide() {
     echo ""
 }
 
-# 交互式申请SAN证书apply_san_cert() {
+# 交互式申请SAN证书
+apply_san_cert() {
     echo ""
     echo "=========================================="
     echo "  📝 交互式申请SAN证书"
@@ -596,7 +602,8 @@ show_cert_guide() {
     fi
 }
 
-# 交互式申请通配符证书apply_wildcard_cert() {
+# 交互式申请通配符证书
+apply_wildcard_cert() {
     echo ""
     echo "=========================================="
     echo "  🌟 交互式申请通配符证书"
@@ -640,7 +647,8 @@ show_cert_guide() {
     fi
 }
 
-# 域名证书自动延期auto_renew_cert() {
+# 域名证书自动延期
+auto_renew_cert() {
     echo ""
     echo "=========================================="
     echo "  🔄 域名证书自动延期"
@@ -678,7 +686,8 @@ show_cert_guide() {
     fi
 }
 
-# 域名证书手动延期manual_renew_cert() {
+# 域名证书手动延期
+manual_renew_cert() {
     echo ""
     echo "=========================================="
     echo "  🖐️  域名证书手动延期"
@@ -719,7 +728,8 @@ show_cert_guide() {
     fi
 }
 
-# 查询延期状态query_renew_status() {
+# 查询延期状态
+query_renew_status() {
     echo ""
     echo "=========================================="
     echo "  📅 查询证书延期状态"
@@ -744,7 +754,8 @@ show_cert_guide() {
     echo ""
 }
 
-# 菜单: SSL证书管理menu_cert_management() {
+# 菜单: SSL证书管理
+menu_cert_management() {
     echo ""
     echo "=========================================="
     echo "  🔒 SSL 证书管理 (Let's Encrypt)"
@@ -1447,7 +1458,8 @@ capture_settings() {
 # 交互式主菜单
 # ============================================================================
 
-# 权限管理菜单permission_management() {
+# 权限管理菜单
+permission_management() {
     echo ""
     echo "=========================================="
     echo "  🔑 权限管理"
