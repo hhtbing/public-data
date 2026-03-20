@@ -9,7 +9,7 @@
 # 更新: 2026-03-14
 #
 # 一键部署（推荐）:
-#   wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing-wisefido/public-data/main/OTA-QL-data/ota-ql-docker-deploy.sh" && chmod +x ota-ql-docker-deploy.sh && sudo ./ota-ql-docker-deploy.sh
+#   wget -O ota-ql-docker-deploy.sh "https://raw.githubusercontent.com/hhtbing/public-data/main/OTA-QL-data/ota-ql-docker-deploy.sh" && chmod +x ota-ql-docker-deploy.sh && sudo ./ota-ql-docker-deploy.sh
 #
 # 服务端口（v4.6 五端口架构）:
 #   HTTPS 10088 — Web管理面板 + API + 固件下载（统一HTTPS）
@@ -37,7 +37,7 @@ BG_YELLOW='\033[43m'
 # ============================================================================
 # 配置变量
 # ============================================================================
-IMAGE_NAME="ghcr.io/hhtbing-wisefido/ota-ql:latest"
+IMAGE_NAME="ghcr.io/hhtbing/ota-ql:latest"
 CONTAINER_NAME="ota-ql"
 DATA_DIR="/opt/ota-ql"
 FIRMWARE_DIR="${DATA_DIR}/firmware"
@@ -208,7 +208,7 @@ pull_latest_image() {
         echo "  2. 认证失败 — 私有仓库需要 docker login ghcr.io"
         echo "  3. 镜像不存在 — 确认 GitHub Actions 已构建成功"
         echo ""
-        echo "手动认证: echo YOUR_TOKEN | docker login ghcr.io -u hhtbing-wisefido --password-stdin"
+        echo "手动认证: echo YOUR_TOKEN | docker login ghcr.io -u hhtbing --password-stdin"
         return 1
     fi
 }
@@ -3983,6 +3983,80 @@ deploy_cert_interactive_menu() {
 }
 
 # ============================================================================
+# 修复 Nginx 默认 Server 证书（0.default.conf） - 解决 443 端口 SNI/证书问题
+# ============================================================================
+fix_default_nginx_cert() {
+    local conf="/www/server/panel/vhost/nginx/0.default.conf"
+    local cert="${CERTS_DIR}/fullchain.pem"
+    local key="${CERTS_DIR}/privkey.pem"
+
+    echo ""
+    echo "=========================================="
+    echo "  修复 Nginx 默认 Server 证书 (0.default.conf)"
+    echo "=========================================="
+    echo ""
+
+    if [ ! -f "${conf}" ]; then
+        log_error "未找到默认 Nginx 配置文件: ${conf}"
+        echo "请确认宝塔面板 Nginx 目录是否存在，并更新此脚本中的路径"
+        return 1
+    fi
+
+    if [ ! -f "${cert}" ] || [ ! -f "${key}" ]; then
+        log_error "OTA-QL 证书文件缺失: ${cert} 或 ${key}"
+        echo "请先通过菜单 [11. SSL证书管理] 部署证书"
+        return 1
+    fi
+
+    local bak="${conf}.bak.$(date +%Y%m%d%H%M%S)"
+    echo "备份原配置: ${conf} -> ${bak}"
+    cp -p "${conf}" "${bak}"
+
+    echo "当前 ssl_certificate 设置："
+    grep -E '^[[:space:]]*ssl_certificate(_key)?' "${conf}" | sed 's/^/  /' || true
+    echo ""
+    echo "将默认 server 证书替换为："
+    echo "  ssl_certificate     ${cert}"
+    echo "  ssl_certificate_key ${key}"
+    echo ""
+
+    # 更新配置
+    if grep -qE '^[[:space:]]*ssl_certificate[[:space:]]+' "${conf}"; then
+        sed -i -E "s@^[[:space:]]*ssl_certificate[[:space:]]+.*@    ssl_certificate ${cert};@" "${conf}"
+    else
+        sed -i -E "/listen[[:space:]]+443[[:space:]]+ssl;/a \\    ssl_certificate ${cert};" "${conf}"
+    fi
+
+    if grep -qE '^[[:space:]]*ssl_certificate_key[[:space:]]+' "${conf}"; then
+        sed -i -E "s@^[[:space:]]*ssl_certificate_key[[:space:]]+.*@    ssl_certificate_key ${key};@" "${conf}"
+    else
+        sed -i -E "/listen[[:space:]]+443[[:space:]]+ssl;/a \\    ssl_certificate_key ${key};" "${conf}"
+    fi
+
+    echo ""
+    echo "修改后 ssl_certificate 设置："
+    grep -E '^[[:space:]]*ssl_certificate(_key)?' "${conf}" | sed 's/^/  /' || true
+    echo ""
+
+    echo "测试 Nginx 配置语法..."
+    if ! nginx -t; then
+        log_error "Nginx 配置测试失败，恢复备份: ${bak}"
+        cp -f "${bak}" "${conf}"
+        nginx -s reload 2>/dev/null || true
+        return 1
+    fi
+
+    echo "重载 Nginx..."
+    nginx -s reload
+    log_success "已更新默认 server 证书并重载 Nginx"
+
+    echo ""
+    echo "建议随后运行："
+    echo "  openssl s_client -connect <host>:443 -noservername | head -n 20"
+    echo "确保返回的证书链与 ota.wisefido.work 相同"
+}
+
+# ============================================================================
 # 部署入口
 # ============================================================================
 
@@ -4938,10 +5012,11 @@ interactive_menu() {
         echo -e "  ${CYAN}11.${NC} SSL证书管理"
         echo -e "  ${CYAN}14.${NC} 固件下载域名设置与查看"
         echo -e "  ${CYAN}15.${NC} Nginx Range 头配置（OTA进度）"
+        echo -e "  ${CYAN}16.${NC} 修复 Nginx 默认 server 证书（解决 443 端口 SNI/证书问题）"
         echo "  12. 退出"
         echo -e "  ${RED}13.${NC} 一键部署 ${RED}(仅测试-不安全)${NC}"
         echo ""
-        read -ep "请选择操作 [1-15]: " choice
+        read -ep "请选择操作 [1-16]: " choice
 
         case $choice in
             1)
@@ -5020,8 +5095,12 @@ interactive_menu() {
                 menu_nginx_range
                 read -ep "按Enter键返回菜单..." dummy
                 ;;
+            16)
+                fix_default_nginx_cert
+                read -ep "按Enter键返回菜单..." dummy
+                ;;
             *)
-                log_warning "无效选择，请输入 1-15"
+                log_warning "无效选择，请输入 1-16"
                 sleep 1
                 ;;
         esac
