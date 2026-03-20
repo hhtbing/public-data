@@ -194,54 +194,49 @@ show_deployed_cert_info() {
     echo "=========================================="
     echo ""
 
-    local candidates=()
+    local candidates_list=""
+    local candidate_count=0
+
+    add_candidate() {
+        candidate_count=$((candidate_count+1))
+        candidates_list="${candidates_list}${candidate_count}|$1|$2|$3\n"
+    }
 
     # 首先检查统一路径
     if [ -f "${CERTS_DIR}/fullchain.pem" ] && [ -f "${CERTS_DIR}/privkey.pem" ]; then
-        candidates+=("${CERTS_DIR}/fullchain.pem|${CERTS_DIR}/privkey.pem|本地目录")
+        add_candidate "${CERTS_DIR}/fullchain.pem" "${CERTS_DIR}/privkey.pem" "本地目录"
     fi
 
     # 检查定义的面板路径
     for path_entry in "${CERT_SEARCH_PATHS[@]}"; do
-        local cert_path=$(echo "$path_entry" | cut -d'|' -f2)
-        local key_path=$(echo "$path_entry" | cut -d'|' -f3)
+        cert_path=$(echo "$path_entry" | cut -d'|' -f2)
+        key_path=$(echo "$path_entry" | cut -d'|' -f3)
         if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
-            local panel=$(echo "$path_entry" | cut -d'|' -f1)
-            candidates+=("$cert_path|$key_path|$panel")
+            panel=$(echo "$path_entry" | cut -d'|' -f1)
+            add_candidate "$cert_path" "$key_path" "$panel"
         fi
     done
 
     # 兼容路径额外搜索
-    local extra_paths=(
-        "/etc/letsencrypt/live/*/fullchain.pem"
-        "/root/.acme.sh/*/fullchain.cer"
-        "/www/server/panel/vhost/cert/*/fullchain.pem"
-        "/www/server/panel/vhost/ssl/*/fullchain.pem"
-        "/etc/nginx/ssl/*/fullchain.pem"
-        "/etc/apache2/ssl/*/fullchain.pem"
-        "/etc/httpd/ssl/*/fullchain.pem"
-        "/var/lib/caddy/.local/share/caddy/certificates/*/*/*.crt"
-    )
-
-    for pattern in "${extra_paths[@]}"; do
+    for pattern in "/etc/letsencrypt/live/*/fullchain.pem" "/root/.acme.sh/*/fullchain.cer" "/www/server/panel/vhost/cert/*/fullchain.pem" "/www/server/panel/vhost/ssl/*/fullchain.pem" "/etc/nginx/ssl/*/fullchain.pem" "/etc/apache2/ssl/*/fullchain.pem" "/etc/httpd/ssl/*/fullchain.pem" "/var/lib/caddy/.local/share/caddy/certificates/*/*/*.crt"; do
         for cert_file in $(find $pattern 2>/dev/null); do
-            local key_file=""
+            key_file=""
             if [ "${cert_file##*.}" = "pem" ]; then
                 key_file=$(echo "$cert_file" | sed 's/fullchain\.pem/privkey\.pem/')
             elif [ "${cert_file##*.}" = "cer" ]; then
-                local domain=$(basename "$(dirname "$cert_file")")
-                key_file=$(dirname "$cert_file")"/${domain}.key
+                domain=$(basename "$(dirname "$cert_file")")
+                key_file="$(dirname "$cert_file")/${domain}.key"
             elif [ "${cert_file##*.}" = "crt" ]; then
                 key_file="${cert_file%.crt}.key"
             fi
 
-            if [ -n "${key_file}" ] && [ -f "$key_file" ]; then
-                candidates+=("$cert_file|$key_file|自动搜索")
+            if [ -n "$key_file" ] && [ -f "$key_file" ]; then
+                add_candidate "$cert_file" "$key_file" "自动搜索"
             fi
         done
     done
 
-    if [ ${#candidates[@]} -eq 0 ]; then
+    if [ "$candidate_count" -eq 0 ]; then
         log_warning "未找到已部署证书，请先部署或手动指定路径"
         echo "  默认证书目录: ${CERTS_DIR}"
         echo "  你可以使用 SSL证书管理 -> 全局搜索系统证书 -> 手动指定路径"
@@ -249,21 +244,18 @@ show_deployed_cert_info() {
         return 1
     fi
 
-    log_success "找到 ${#candidates[@]} 个候选证书"
+    log_success "找到 ${candidate_count} 个候选证书"
 
-    local idx=0
-    for item in "${candidates[@]}"; do
+    idx=0
+    echo "$candidates_list" | while IFS='|' read -r num cert_path key_path src; do
         idx=$((idx+1))
-        local cert_path=$(echo "$item" | cut -d'|' -f1)
-        local key_path=$(echo "$item" | cut -d'|' -f2)
-        local src=$(echo "$item" | cut -d'|' -f3)
         echo "  [$idx] 源: $src"
         echo "      证书: $cert_path"
         echo "      私钥: $key_path"
     done
 
-    if [ ${#candidates[@]} -gt 1 ]; then
-        read -ep "请选择要展示详细状态的证书 (1-${#candidates[@]}, 0 取消, 默认1): " sel
+    if [ "$candidate_count" -gt 1 ]; then
+        read -ep "请选择要展示详细状态的证书 (1-${candidate_count}, 0 取消, 默认1): " sel
         if [ -z "$sel" ]; then
             sel=1
         fi
@@ -272,7 +264,7 @@ show_deployed_cert_info() {
             echo ""
             return 0
         fi
-        if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#candidates[@]} ]; then
+        if ! printf '%s' "$sel" | grep -qE '^[0-9]+$' || [ "$sel" -lt 1 ] || [ "$sel" -gt "$candidate_count" ]; then
             log_warning "选择无效，默认取第1个"
             sel=1
         fi
@@ -280,9 +272,18 @@ show_deployed_cert_info() {
         sel=1
     fi
 
-    local choice=${candidates[$((sel-1))]}
-    local chosen_cert=$(echo "$choice" | cut -d'|' -f1)
-    local chosen_key=$(echo "$choice" | cut -d'|' -f2)
+    choice=""
+    while IFS='|' read -r num cert_path key_path src; do
+        if [ "$num" -eq "$sel" ]; then
+            choice="$num|$cert_path|$key_path|$src"
+            break
+        fi
+    done <<EOF
+$candidates_list
+EOF
+
+    chosen_cert=$(echo "$choice" | cut -d'|' -f2)
+    chosen_key=$(echo "$choice" | cut -d'|' -f3)
 
     echo ""
     echo "正在展示: $chosen_cert"
