@@ -3,13 +3,17 @@
 ###############################################################################
 # 通用Linux自动化工具集
 # 文件名: linux-tools.sh
-# 用途: 提供系统信息查询、SSL证书管理、网络工具等通用Linux自动化功能
+# 用途: 提供系统信息查询、SSL证书管理、网络工具、抓包管理等通用Linux自动化功能
 # 作者: WiseFido Technologies
-# 版本: v1.0
-# 更新: 2024-01-01
+# 版本: v2.0
+# 更新: 2026-03-20
 #
 # 一键部署:
 #   wget -O linux-tools.sh "https://raw.githubusercontent.com/hhtbing/public-data/main/linux-tools/linux-tools.sh" && chmod +x linux-tools.sh && sudo ./linux-tools.sh
+#
+# 版本历史:
+#   v2.0 (2026-03-20): 增加版本化管理、抓包管理功能
+#   v1.0 (2024-01-01): 初始版本，包含系统信息、SSL管理、网络工具、系统工具、文件管理
 ###############################################################################
 
 # ============================================================================
@@ -621,6 +625,406 @@ file_tools() {
 }
 
 # ============================================================================
+# 抓包管理
+# ============================================================================
+
+# 检查抓包工具是否安装
+check_capture_tools() {
+    local tools_available=()
+
+    if command -v tcpdump &>/dev/null; then
+        tools_available+=("tcpdump")
+    fi
+
+    if command -v tshark &>/dev/null; then
+        tools_available+=("tshark")
+    fi
+
+    echo "${tools_available[@]}"
+}
+
+# 获取可用网口
+get_available_interfaces() {
+    local interfaces=()
+
+    # 使用ip命令获取网口列表
+    if command -v ip &>/dev/null; then
+        interfaces=($(ip link show | grep "^[0-9]" | awk -F': ' '{print $2}' | cut -d'@' -f1))
+    elif command -v ifconfig &>/dev/null; then
+        interfaces=($(ifconfig -a | grep "^[a-zA-Z]" | awk '{print $1}'))
+    fi
+
+    echo "${interfaces[@]}"
+}
+
+# 抓包管理主菜单
+capture_management() {
+    echo ""
+    echo "=========================================="
+    echo "  🕵️  抓包管理"
+    echo "=========================================="
+    echo ""
+
+    echo "  1. 开始抓包"
+    echo "  2. 分析已保存的包"
+    echo "  3. 导入包文件"
+    echo "  4. 导出包文件"
+    echo "  5. 抓包工具设置"
+    echo "  0. 返回主菜单"
+    echo ""
+    read -ep "请选择 [0-5]: " capture_choice
+
+    case $capture_choice in
+        1)
+            start_capture
+            ;;
+        2)
+            analyze_capture
+            ;;
+        3)
+            import_capture
+            ;;
+        4)
+            export_capture
+            ;;
+        5)
+            capture_settings
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            log_warning "无效选择，请输入 0-5"
+            sleep 1
+            ;;
+    esac
+}
+
+# 开始抓包
+start_capture() {
+    echo ""
+    echo "=========================================="
+    echo "  🎯 开始抓包"
+    echo "=========================================="
+    echo ""
+
+    # 检查抓包工具
+    local available_tools=($(check_capture_tools))
+    if [ ${#available_tools[@]} -eq 0 ]; then
+        log_error "未检测到抓包工具（tcpdump/tshark）"
+        echo "  请安装工具: sudo apt install tcpdump tshark -y 或 sudo yum install tcpdump wireshark-cli -y"
+        return 1
+    fi
+
+    # 选择工具
+    echo "可用的抓包工具:"
+    for i in "${!available_tools[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${available_tools[$i]}"
+    done
+    echo ""
+    read -ep "请选择工具 [1-${#available_tools[@]}]: " tool_choice
+
+    if ! [[ "$tool_choice" =~ ^[0-9]+$ ]] || [ "$tool_choice" -lt 1 ] || [ "$tool_choice" -gt ${#available_tools[@]} ]; then
+        log_error "无效的工具选择"
+        return 1
+    fi
+
+    local selected_tool=${available_tools[$((tool_choice-1))]}
+
+    # 选择网口
+    local interfaces=($(get_available_interfaces))
+    if [ ${#interfaces[@]} -eq 0 ]; then
+        log_error "无法获取网口列表"
+        return 1
+    fi
+
+    echo ""
+    echo "可用的网口:"
+    for i in "${!interfaces[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${interfaces[$i]}"
+    done
+    echo ""
+    read -ep "请选择网口 [1-${#interfaces[@]}]: " iface_choice
+
+    if ! [[ "$iface_choice" =~ ^[0-9]+$ ]] || [ "$iface_choice" -lt 1 ] || [ "$iface_choice" -gt ${#interfaces[@]} ]; then
+        log_error "无效的网口选择"
+        return 1
+    fi
+
+    local selected_iface=${interfaces[$((iface_choice-1))]}
+
+    # 设置过滤条件
+    echo ""
+    read -ep "输入过滤条件 (如 tcp port 80, 留空表示不过滤): " filter
+
+    # 设置抓包数量
+    echo ""
+    read -ep "输入抓包数量 (留空表示无限): " packet_count
+
+    # 设置保存文件名
+    echo ""
+    local default_file="capture_$(date +%Y%m%d_%H%M%S).pcap"
+    read -ep "输入保存文件名 (默认: $default_file): " save_file
+    [ -z "$save_file" ] && save_file="$default_file"
+
+    # 开始抓包
+    echo ""
+    echo -e "${YELLOW}💡 正在使用 ${selected_tool} 在 ${selected_iface} 上抓包...${NC}"
+    echo -e "${YELLOW}💡 按 Ctrl+C 停止抓包${NC}"
+    echo ""
+
+    local capture_cmd=""
+    if [ "$selected_tool" = "tcpdump" ]; then
+        capture_cmd="tcpdump -i $selected_iface -w $save_file"
+        [ -n "$filter" ] && capture_cmd="$capture_cmd $filter"
+        [ -n "$packet_count" ] && capture_cmd="$capture_cmd -c $packet_count"
+    elif [ "$selected_tool" = "tshark" ]; then
+        capture_cmd="tshark -i $selected_iface -w $save_file"
+        [ -n "$filter" ] && capture_cmd="$capture_cmd -f '$filter'"
+        [ -n "$packet_count" ] && capture_cmd="$capture_cmd -c $packet_count"
+    fi
+
+    eval "$capture_cmd"
+
+    if [ $? -eq 0 ]; then
+        log_success "抓包完成！"
+        echo "  包文件已保存为: $save_file"
+        echo -e "  ${YELLOW}💡 可使用 '2. 分析已保存的包' 选项查看分析结果${NC}"
+    else
+        log_error "抓包失败"
+    fi
+}
+
+# 分析已保存的包
+analyze_capture() {
+    echo ""
+    echo "=========================================="
+    echo "  📊 分析已保存的包"
+    echo "=========================================="
+    echo ""
+
+    # 查找当前目录下的pcap文件
+    local pcap_files=($(find . -maxdepth 1 -name "*.pcap" -o -name "*.pcapng" | sort))
+
+    if [ ${#pcap_files[@]} -eq 0 ]; then
+        log_warning "当前目录下未找到pcap/pcapng文件"
+        echo "  请先使用 '1. 开始抓包' 功能或导入包文件"
+        return 1
+    fi
+
+    # 选择要分析的文件
+    echo "可用的包文件:"
+    for i in "${!pcap_files[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${pcap_files[$i]}"
+    done
+    echo ""
+    read -ep "请选择文件 [1-${#pcap_files[@]}]: " file_choice
+
+    if ! [[ "$file_choice" =~ ^[0-9]+$ ]] || [ "$file_choice" -lt 1 ] || [ "$file_choice" -gt ${#pcap_files[@]} ]; then
+        log_error "无效的文件选择"
+        return 1
+    fi
+
+    local selected_file=${pcap_files[$((file_choice-1))]}
+
+    # 选择分析工具
+    local available_tools=($(check_capture_tools))
+    if [ ${#available_tools[@]} -eq 0 ]; then
+        log_error "未检测到抓包工具（tcpdump/tshark）"
+        return 1
+    fi
+
+    echo ""
+    echo "可用的分析工具:"
+    for i in "${!available_tools[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${available_tools[$i]}"
+    done
+    echo ""
+    read -ep "请选择工具 [1-${#available_tools[@]}]: " tool_choice
+
+    if ! [[ "$tool_choice" =~ ^[0-9]+$ ]] || [ "$tool_choice" -lt 1 ] || [ "$tool_choice" -gt ${#available_tools[@]} ]; then
+        log_error "无效的工具选择"
+        return 1
+    fi
+
+    local selected_tool=${available_tools[$((tool_choice-1))]}
+
+    # 选择分析类型
+    echo ""
+    echo "分析类型:"
+    echo "  1. 包统计信息"
+    echo "  2. 显示所有包内容"
+    echo "  3. 按协议过滤显示"
+    echo "  4. 按关键词搜索"
+    echo ""
+    read -ep "请选择分析类型 [1-4]: " analyze_type
+
+    case $analyze_type in
+        1)
+            echo ""
+            echo "包统计信息:"
+            echo "────────────────────────────────────"
+            if [ "$selected_tool" = "tcpdump" ]; then
+                tcpdump -r "$selected_file" -q | sort | uniq -c | sort -nr
+            elif [ "$selected_tool" = "tshark" ]; then
+                tshark -r "$selected_file" -z protocols,tree
+            fi
+            ;;
+        2)
+            echo ""
+            echo "包内容 (显示前50个):"
+            echo "────────────────────────────────────"
+            if [ "$selected_tool" = "tcpdump" ]; then
+                tcpdump -r "$selected_file" -n -v | head -50
+            elif [ "$selected_tool" = "tshark" ]; then
+                tshark -r "$selected_file" -V | head -100
+            fi
+            ;;
+        3)
+            echo ""
+            read -ep "输入协议名称 (如 tcp, udp, http): " protocol
+            echo ""
+            echo "按 ${protocol} 协议过滤的包:"
+            echo "────────────────────────────────────"
+            if [ "$selected_tool" = "tcpdump" ]; then
+                tcpdump -r "$selected_file" -n "$protocol" | head -50
+            elif [ "$selected_tool" = "tshark" ]; then
+                tshark -r "$selected_file" -Y "$protocol" | head -50
+            fi
+            ;;
+        4)
+            echo ""
+            read -ep "输入关键词 (如 IP地址、端口号): " keyword
+            echo ""
+            echo "包含 '${keyword}' 的包:"
+            echo "────────────────────────────────────"
+            if [ "$selected_tool" = "tcpdump" ]; then
+                tcpdump -r "$selected_file" -n | grep -i "$keyword" | head -50
+            elif [ "$selected_tool" = "tshark" ]; then
+                tshark -r "$selected_file" -Y "frame contains '$keyword'" | head -50
+            fi
+            ;;
+        *)
+            log_warning "无效的分析类型选择"
+            return 1
+            ;;
+    esac
+
+    echo ""
+    log_success "分析完成！"
+}
+
+# 导入包文件
+import_capture() {
+    echo ""
+    echo "=========================================="
+    echo "  📥 导入包文件"
+    echo "=========================================="
+    echo ""
+
+    read -ep "请输入包文件路径 (支持 .pcap 和 .pcapng 格式): " import_path
+
+    if [ ! -f "$import_path" ]; then
+        log_error "文件不存在: $import_path"
+        return 1
+    fi
+
+    # 检查文件格式
+    local file_ext=$(echo "$import_path" | awk -F. '{print $NF}')
+    if [[ "$file_ext" != "pcap" && "$file_ext" != "pcapng" ]]; then
+        log_error "不支持的文件格式: $file_ext (仅支持 .pcap 和 .pcapng)"
+        return 1
+    fi
+
+    # 复制到当前目录
+    local new_name="imported_$(date +%Y%m%d_%H%M%S).$file_ext"
+    cp "$import_path" "$new_name"
+
+    if [ $? -eq 0 ]; then
+        log_success "包文件导入成功！"
+        echo "  导入的文件: $new_name"
+        echo -e "  ${YELLOW}💡 可使用 '2. 分析已保存的包' 选项查看分析结果${NC}"
+    else
+        log_error "包文件导入失败"
+    fi
+}
+
+# 导出包文件
+export_capture() {
+    echo ""
+    echo "=========================================="
+    echo "  📤 导出包文件"
+    echo "=========================================="
+    echo ""
+
+    # 查找当前目录下的pcap文件
+    local pcap_files=($(find . -maxdepth 1 -name "*.pcap" -o -name "*.pcapng" | sort))
+
+    if [ ${#pcap_files[@]} -eq 0 ]; then
+        log_warning "当前目录下未找到pcap/pcapng文件"
+        return 1
+    fi
+
+    # 选择要导出的文件
+    echo "可用的包文件:"
+    for i in "${!pcap_files[@]}"; do
+        echo -e "  ${GREEN}$((i+1)).${NC} ${pcap_files[$i]}"
+    done
+    echo ""
+    read -ep "请选择文件 [1-${#pcap_files[@]}]: " file_choice
+
+    if ! [[ "$file_choice" =~ ^[0-9]+$ ]] || [ "$file_choice" -lt 1 ] || [ "$file_choice" -gt ${#pcap_files[@]} ]; then
+        log_error "无效的文件选择"
+        return 1
+    fi
+
+    local selected_file=${pcap_files[$((file_choice-1))]}
+
+    # 输入导出路径
+    echo ""
+    read -ep "请输入导出路径 (如 /tmp/exported.pcap): " export_path
+
+    # 复制文件
+    cp "$selected_file" "$export_path"
+
+    if [ $? -eq 0 ]; then
+        log_success "包文件导出成功！"
+        echo "  导出到: $export_path"
+    else
+        log_error "包文件导出失败"
+    fi
+}
+
+# 抓包工具设置
+capture_settings() {
+    echo ""
+    echo "=========================================="
+    echo "  ⚙️  抓包工具设置"
+    echo "=========================================="
+    echo ""
+
+    local available_tools=($(check_capture_tools))
+
+    echo "当前已安装的工具:"
+    if [ ${#available_tools[@]} -eq 0 ]; then
+        echo -e "  ${RED}✗${NC} 无抓包工具安装"
+    else
+        for tool in "${available_tools[@]}"; do
+            echo -e "  ${GREEN}✓${NC} $tool"
+        done
+    fi
+
+    echo ""
+    echo "安装命令参考:"
+    echo "  Debian/Ubuntu: sudo apt install tcpdump tshark -y"
+    echo "  CentOS/RHEL: sudo yum install tcpdump wireshark-cli -y"
+    echo "  Arch Linux: sudo pacman -S tcpdump wireshark-cli -y"
+    echo ""
+
+    log_info "抓包工具设置完成！"
+}
+
+# ============================================================================
 # 交互式主菜单
 # ============================================================================
 
@@ -630,7 +1034,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "=========================================="
-        echo "  🚀 通用Linux自动化工具集 (v1.0)"
+        echo "  🚀 通用Linux自动化工具集 (v2.0)"
         echo "=========================================="
         echo ""
         echo -e "  ${GREEN}1.${NC}  🖥️  查询系统信息"
@@ -638,9 +1042,10 @@ interactive_menu() {
         echo -e "  ${GREEN}3.${NC}  📡 网络工具"
         echo -e "  ${GREEN}4.${NC}  🛠️  系统工具"
         echo -e "  ${GREEN}5.${NC}  📁 文件管理"
+        echo -e "  ${GREEN}6.${NC}  🕵️  抓包管理"
         echo "  0. 🚪 退出"
         echo ""
-        read -ep "请选择操作 [0-5]: " choice
+        read -ep "请选择操作 [0-6]: " choice
 
         case $choice in
             1)
@@ -661,6 +1066,10 @@ interactive_menu() {
                 ;;
             5)
                 file_tools
+                read -ep "按Enter键返回菜单..." dummy
+                ;;
+            6)
+                capture_management
                 read -ep "按Enter键返回菜单..." dummy
                 ;;
             0)
@@ -685,12 +1094,44 @@ main() {
     echo ""
     echo "=========================================="
     echo "  🚀 通用Linux自动化工具集"
-    echo "  版本: v1.0 | 适用于各种Linux系统"
-    echo "  功能: 系统信息、SSL管理、网络工具、系统工具、文件管理"
+    echo "  版本: v2.0 | 适用于各种Linux系统"
+    echo "  功能: 系统信息、SSL管理、网络工具、系统工具、文件管理、抓包管理"
     echo "=========================================="
     echo ""
     echo -e "${YELLOW}💡 提示: 使用方向键和回车键进行操作${NC}"
     echo ""
+
+    # 参数处理
+    if [ $# -gt 0 ]; then
+        case $1 in
+            --version|-v)
+                echo "通用Linux自动化工具集 v2.0"
+                echo "更新日期: 2026-03-20"
+                echo ""
+                echo "版本历史:"
+                echo "  v2.0 (2026-03-20): 增加版本化管理、抓包管理功能"
+                echo "  v1.0 (2024-01-01): 初始版本"
+                exit 0
+                ;;
+            --help|-h)
+                echo "使用方法: sudo ./linux-tools.sh [选项]"
+                echo ""
+                echo "选项:"
+                echo "  --version, -v    显示版本信息"
+                echo "  --help, -h       显示帮助信息"
+                echo ""
+                echo "主菜单功能:"
+                echo "  1. 查询系统信息"
+                echo "  2. SSL证书管理"
+                echo "  3. 网络工具"
+                echo "  4. 系统工具"
+                echo "  5. 文件管理"
+                echo "  6. 抓包管理"
+                echo "  0. 退出"
+                exit 0
+                ;;
+        esac
+    fi
 
     # 检查root权限
     if [ "$(id -u)" -ne 0 ]; then
