@@ -37,6 +37,10 @@ BG_YELLOW='\033[43m'
 CERTS_DIR="/opt/certs"
 LOG_DIR="/var/log/linux-tools"
 
+# 权限管理变量
+CURRENT_USER=$(whoami)
+HAS_ROOT=false
+
 # 创建必要目录
 mkdir -p "${CERTS_DIR}" "${LOG_DIR}" 2>/dev/null
 
@@ -68,11 +72,51 @@ CERT_SEARCH_PATHS=(
 # ============================================================================
 # 日志函数
 # ============================================================================
-log_info()     { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success()  { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-log_warning()  { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-log_error()    { echo -e "${RED}[ERROR]${NC} $1"; }
-log_highlight(){ echo -e "${CYAN}$1${NC}"; }
+log_info()     { echo -e "${BLUE}[INFO]${NC} $1"; }log_success()  { echo -e "${GREEN}[SUCCESS]${NC} $1"; }log_warning()  { echo -e "${YELLOW}[WARNING]${NC} $1"; }log_error()    { echo -e "${RED}[ERROR]${NC} $1"; }log_highlight(){ echo -e "${CYAN}$1${NC}"; }
+
+# 检查当前权限check_permission() {
+    if [ "$(id -u)" -eq 0 ]; then
+        HAS_ROOT=true
+        log_success "当前用户: root (管理员权限)"
+    else
+        HAS_ROOT=false
+        log_info "当前用户: $CURRENT_USER (普通用户权限)"
+    fi
+}
+
+# 切换到root权限switch_to_root() {
+    if [ "$HAS_ROOT" = true ]; then
+        log_warning "已经是管理员权限，无需切换"
+        return 0
+    fi
+
+    log_info "正在尝试切换到管理员权限..."
+
+    # 检查sudo是否可用
+    if command -v sudo &>/dev/null; then
+        log_info "使用sudo切换权限"
+        # 重新以root权限执行脚本
+        exec sudo "$0" "$@"
+    else
+        log_error "未找到sudo命令，无法切换权限"
+        return 1
+    fi
+}
+
+# 切换回普通用户权限switch_to_user() {
+    if [ "$HAS_ROOT" = false ]; then
+        log_warning "已经是普通用户权限，无需切换"
+        return 0
+    fi
+
+    if [ "$CURRENT_USER" = "root" ]; then
+        log_error "无法从root切换到其他用户，因为原始用户未知"
+        return 1
+    fi
+
+    log_info "正在切换回普通用户权限..."
+    exec su - "$CURRENT_USER" -c "$0 $@"
+}
 
 # ============================================================================
 # 系统信息查询
@@ -348,22 +392,379 @@ show_cert_guide() {
     echo ""
 }
 
-# 菜单: SSL证书管理
-menu_cert_management() {
+# 检查Let's Encrypt客户端是否安装check_letsencrypt_client() {
+    if command -v certbot &>/dev/null; then
+        echo "certbot"
+        return 0
+    elif command -v acme.sh &>/dev/null; then
+        echo "acme.sh"
+        return 0
+    else
+        echo "none"
+        return 1
+    fi
+}
+
+# 安装Let's Encrypt客户端install_letsencrypt_client() {
+    local client_choice
+
+    echo ""
+    echo "请选择要安装的Let's Encrypt客户端:"
+    echo "  1. Certbot (推荐)"
+    echo "  2. acme.sh"
+    echo "  0. 取消"
+    echo ""
+    read -ep "请选择 [0-2]: " client_choice
+
+    case $client_choice in
+        1)
+            log_info "正在安装Certbot..."
+            if command -v apt &>/dev/null; then
+                apt update && apt install -y certbot
+            elif command -v yum &>/dev/null; then
+                yum install -y certbot
+            elif command -v dnf &>/dev/null; then
+                dnf install -y certbot
+            elif command -v pacman &>/dev/null; then
+                pacman -S --noconfirm certbot
+            else
+                log_error "不支持的包管理器"
+                return 1
+            fi
+            ;;
+        2)
+            log_info "正在安装acme.sh..."
+            curl https://get.acme.sh | sh
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            log_warning "无效选择"
+            return 1
+            ;;
+    esac
+
+    if [ $? -eq 0 ]; then
+        log_success "Let's Encrypt客户端安装成功"
+        return 0
+    else
+        log_error "Let's Encrypt客户端安装失败"
+        return 1
+    fi
+}
+
+# 跨域名证书部署deploy_cross_domain_cert() {
     echo ""
     echo "=========================================="
-    echo "  🔒 SSL 证书管理"
+    echo "  🌐 跨域名证书部署"
     echo "=========================================="
     echo ""
 
-    echo "  1. 查看当前证书状态"
-    echo "  2. 按域名搜索并部署证书"
-    echo "  3. 全局搜索系统中所有证书"
-    echo "  4. 手动指定证书路径"
-    echo "  5. SSL证书申请指南"
-    echo "  0. 返回主菜单"
+    # 检查证书客户端
+    local client=$(check_letsencrypt_client)
+    if [ "$client" = "none" ]; then
+        log_warning "未检测到Let's Encrypt客户端"
+        install_letsencrypt_client
+        client=$(check_letsencrypt_client)
+        if [ "$client" = "none" ]; then
+            return 1
+        fi
+    fi
+
+    # 获取主域名
+    read -ep "请输入主域名 (如 example.com): " main_domain
+    if [ -z "$main_domain" ]; then
+        log_warning "未输入主域名"
+        return 1
+    fi
+
+    # 获取额外域名
+    read -ep "请输入额外域名 (用空格分隔，如 www.example.com api.example.com): " extra_domains
+
+    # 构建域名列表
+    local domains=(-d "$main_domain")
+    for domain in $extra_domains; do
+        domains+=(-d "$domain")
+    done
+
+    log_info "正在使用 $client 申请证书..."
+
+    if [ "$client" = "certbot" ]; then
+        certbot certonly --standalone "${domains[@]}"
+    elif [ "$client" = "acme.sh" ]; then
+        ~/.acme.sh/acme.sh --issue "${domains[@]}" --standalone
+    fi
+
+    if [ $? -eq 0 ]; then
+        log_success "证书申请成功！"
+        search_certs_for_domain "$main_domain"
+    else
+        log_error "证书申请失败"
+    fi
+}
+
+# 查询证书覆盖情况query_cert_coverage() {
     echo ""
-    read -ep "请选择 [0-5]: " cert_choice
+    echo "=========================================="
+    echo "  📋 证书覆盖情况查询"
+    echo "=========================================="
+    echo ""
+
+    # 获取域名列表
+    read -ep "请输入要查询的域名 (用空格分隔): " domains
+    if [ -z "$domains" ]; then
+        log_warning "未输入域名"
+        return 1
+    fi
+
+    echo ""
+    echo "证书覆盖情况:"
+    echo "────────────────────────────────────"
+
+    for domain in $domains; do
+        # 检查证书是否存在
+        local found=false
+        for path_entry in "${CERT_SEARCH_PATHS[@]}"; do
+            local cert_path=$(echo "$path_entry" | cut -d'|' -f2 | sed "s/<DOMAIN>/$domain/g")
+            if [ -f "$cert_path" ]; then
+                echo -e "  ${GREEN}✓${NC} $domain - 已覆盖"
+                found=true
+                break
+            fi
+        done
+
+        if [ "$found" = false ]; then
+            echo -e "  ${RED}✗${NC} $domain - 未覆盖"
+        fi
+    done
+    echo ""
+}
+
+# 交互式申请SAN证书apply_san_cert() {
+    echo ""
+    echo "=========================================="
+    echo "  📝 交互式申请SAN证书"
+    echo "=========================================="
+    echo ""
+    echo "SAN (Subject Alternative Name) 证书允许在单个证书中包含多个域名"
+    echo ""
+
+    # 检查证书客户端
+    local client=$(check_letsencrypt_client)
+    if [ "$client" = "none" ]; then
+        log_warning "未检测到Let's Encrypt客户端"
+        install_letsencrypt_client
+        client=$(check_letsencrypt_client)
+        if [ "$client" = "none" ]; then
+            return 1
+        fi
+    fi
+
+    # 获取域名
+    local domains=()
+    local domain_count=0
+
+    while true; do
+        domain_count=$((domain_count + 1))
+        read -ep "请输入第 $domain_count 个域名 (留空结束): " domain
+        if [ -z "$domain" ]; then
+            break
+        fi
+        domains+=(-d "$domain")
+    done
+
+    if [ ${#domains[@]} -eq 0 ]; then
+        log_warning "未输入任何域名"
+        return 1
+    fi
+
+    log_info "正在使用 $client 申请SAN证书..."
+
+    if [ "$client" = "certbot" ]; then
+        certbot certonly --standalone "${domains[@]}"
+    elif [ "$client" = "acme.sh" ]; then
+        ~/.acme.sh/acme.sh --issue "${domains[@]}" --standalone
+    fi
+
+    if [ $? -eq 0 ]; then
+        log_success "SAN证书申请成功！"
+        local main_domain=$(echo "${domains[0]}" | cut -d' ' -f2)
+        search_certs_for_domain "$main_domain"
+    else
+        log_error "SAN证书申请失败"
+    fi
+}
+
+# 交互式申请通配符证书apply_wildcard_cert() {
+    echo ""
+    echo "=========================================="
+    echo "  🌟 交互式申请通配符证书"
+    echo "=========================================="
+    echo ""
+    echo "通配符证书允许保护所有子域名 (如 *.example.com)"
+    echo "注意: 通配符证书需要DNS验证，需要手动配置DNS记录"
+    echo ""
+
+    # 检查证书客户端
+    local client=$(check_letsencrypt_client)
+    if [ "$client" = "none" ]; then
+        log_warning "未检测到Let's Encrypt客户端"
+        install_letsencrypt_client
+        client=$(check_letsencrypt_client)
+        if [ "$client" = "none" ]; then
+            return 1
+        fi
+    fi
+
+    # 获取域名
+    read -ep "请输入域名 (如 example.com): " domain
+    if [ -z "$domain" ]; then
+        log_warning "未输入域名"
+        return 1
+    fi
+
+    log_info "正在使用 $client 申请通配符证书..."
+
+    if [ "$client" = "certbot" ]; then
+        certbot certonly --manual --preferred-challenges=dns -d "*.${domain}" -d "${domain}"
+    elif [ "$client" = "acme.sh" ]; then
+        ~/.acme.sh/acme.sh --issue -d "*.${domain}" -d "${domain}" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please
+    fi
+
+    if [ $? -eq 0 ]; then
+        log_success "通配符证书申请成功！"
+        search_certs_for_domain "$domain"
+    else
+        log_error "通配符证书申请失败"
+    fi
+}
+
+# 域名证书自动延期auto_renew_cert() {
+    echo ""
+    echo "=========================================="
+    echo "  🔄 域名证书自动延期"
+    echo "=========================================="
+    echo ""
+
+    # 检查证书客户端
+    local client=$(check_letsencrypt_client)
+    if [ "$client" = "none" ]; then
+        log_warning "未检测到Let's Encrypt客户端"
+        return 1
+    fi
+
+    log_info "正在设置证书自动延期..."
+
+    if [ "$client" = "certbot" ]; then
+        # Certbot通常会自动设置定时任务
+        if systemctl list-units --type=service | grep -q certbot; then
+            log_success "Certbot自动延期服务已存在"
+        else
+            certbot renew --dry-run
+            if [ $? -eq 0 ]; then
+                log_success "Certbot自动延期已配置"
+            else
+                log_error "Certbot自动延期配置失败"
+            fi
+        fi
+    elif [ "$client" = "acme.sh" ]; then
+        ~/.acme.sh/acme.sh --install-cronjob
+        if [ $? -eq 0 ]; then
+            log_success "acme.sh自动延期已配置"
+        else
+            log_error "acme.sh自动延期配置失败"
+        fi
+    fi
+}
+
+# 域名证书手动延期manual_renew_cert() {
+    echo ""
+    echo "=========================================="
+    echo "  🖐️  域名证书手动延期"
+    echo "=========================================="
+    echo ""
+
+    # 检查证书客户端
+    local client=$(check_letsencrypt_client)
+    if [ "$client" = "none" ]; then
+        log_warning "未检测到Let's Encrypt客户端"
+        return 1
+    fi
+
+    # 获取域名
+    read -ep "请输入要延期的域名 (留空延期所有): " domain
+
+    log_info "正在手动延期证书..."
+
+    if [ "$client" = "certbot" ]; then
+        if [ -n "$domain" ]; then
+            certbot renew --cert-name "$domain"
+        else
+            certbot renew
+        fi
+    elif [ "$client" = "acme.sh" ]; then
+        if [ -n "$domain" ]; then
+            ~/.acme.sh/acme.sh --renew -d "$domain"
+        else
+            ~/.acme.sh/acme.sh --renew-all
+        fi
+    fi
+
+    if [ $? -eq 0 ]; then
+        log_success "证书延期成功！"
+        [ -n "$domain" ] && search_certs_for_domain "$domain"
+    else
+        log_error "证书延期失败"
+    fi
+}
+
+# 查询延期状态query_renew_status() {
+    echo ""
+    echo "=========================================="
+    echo "  📅 查询证书延期状态"
+    echo "=========================================="
+    echo ""
+
+    # 检查证书客户端
+    local client=$(check_letsencrypt_client)
+    if [ "$client" = "none" ]; then
+        log_warning "未检测到Let's Encrypt客户端"
+        return 1
+    fi
+
+    log_info "正在查询证书延期状态..."
+
+    if [ "$client" = "certbot" ]; then
+        certbot certificates
+    elif [ "$client" = "acme.sh" ]; then
+        ~/.acme.sh/acme.sh --list
+    fi
+
+    echo ""
+}
+
+# 菜单: SSL证书管理menu_cert_management() {
+    echo ""
+    echo "=========================================="
+    echo "  🔒 SSL 证书管理 (Let's Encrypt)"
+    echo "=========================================="
+    echo ""
+
+    echo "  1. 查看当前证书状态 - 显示已部署证书的详细信息"
+    echo "  2. 按域名搜索并部署证书 - 搜索特定域名的证书并部署"
+    echo "  3. 全局搜索系统中所有证书 - 查找系统中所有可用证书"
+    echo "  4. 手动指定证书路径 - 手动选择证书文件进行部署"
+    echo "  5. 跨域名证书部署 - 部署包含多个域名的证书"
+    echo "  6. 查询证书覆盖情况 - 检查多个域名的证书覆盖状态"
+    echo "  7. 交互式申请SAN证书 - 申请包含多个域名的SAN证书"
+    echo "  8. 交互式申请通配符证书 - 申请保护所有子域名的证书"
+    echo "  9. 域名证书自动延期 - 设置证书自动延期服务"
+    echo " 10. 域名证书手动延期 - 手动延期指定域名的证书"
+    echo " 11. 查询证书延期状态 - 查看所有证书的延期状态"
+    echo " 0. 返回主菜单"
+    echo ""
+    read -ep "请选择 [0-11]: " cert_choice
 
     case $cert_choice in
         1)
@@ -414,13 +815,31 @@ menu_cert_management() {
             manual_deploy_cert
             ;;
         5)
-            show_cert_guide
+            deploy_cross_domain_cert
+            ;;
+        6)
+            query_cert_coverage
+            ;;
+        7)
+            apply_san_cert
+            ;;
+        8)
+            apply_wildcard_cert
+            ;;
+        9)
+            auto_renew_cert
+            ;;
+        10)
+            manual_renew_cert
+            ;;
+        11)
+            query_renew_status
             ;;
         0)
             return 0
             ;;
         *)
-            log_warning "无效选择，请输入 0-5"
+            log_warning "无效选择，请输入 0-11"
             sleep 1
             ;;
     esac
@@ -1028,6 +1447,42 @@ capture_settings() {
 # 交互式主菜单
 # ============================================================================
 
+# 权限管理菜单permission_management() {
+    echo ""
+    echo "=========================================="
+    echo "  🔑 权限管理"
+    echo "=========================================="
+    echo ""
+    echo "当前权限状态:"
+    if [ "$HAS_ROOT" = true ]; then
+        echo -e "  ${GREEN}✓ 管理员权限 (root)${NC}"
+    else
+        echo -e "  ${YELLOW}⚠ 普通用户权限${NC}"
+    fi
+    echo ""
+    echo "  1. 切换到管理员权限 (sudo)"
+    echo "  2. 切换回普通用户权限"
+    echo "  0. 返回主菜单"
+    echo ""
+    read -ep "请选择 [0-2]: " perm_choice
+
+    case $perm_choice in
+        1)
+            switch_to_root "$@"
+            ;;
+        2)
+            switch_to_user "$@"
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            log_warning "无效选择，请输入 0-2"
+            sleep 1
+            ;;
+    esac
+}
+
 interactive_menu() {
     trap 'echo ""; log_info "返回主菜单..."; echo ""' SIGINT
 
@@ -1037,15 +1492,16 @@ interactive_menu() {
         echo "  🚀 通用Linux自动化工具集 (v2.0)"
         echo "=========================================="
         echo ""
-        echo -e "  ${GREEN}1.${NC}  🖥️  查询系统信息"
-        echo -e "  ${GREEN}2.${NC}  🔒 SSL证书管理"
-        echo -e "  ${GREEN}3.${NC}  📡 网络工具"
-        echo -e "  ${GREEN}4.${NC}  🛠️  系统工具"
-        echo -e "  ${GREEN}5.${NC}  📁 文件管理"
-        echo -e "  ${GREEN}6.${NC}  🕵️  抓包管理"
-        echo "  0. 🚪 退出"
+        echo -e "  ${GREEN}1.${NC}  🖥️  查询系统信息 - 查看系统详细配置信息"
+        echo -e "  ${GREEN}2.${NC}  🔒 SSL证书管理 - 管理Let's Encrypt SSL证书"
+        echo -e "  ${GREEN}3.${NC}  📡 网络工具 - 网络连接、端口、路由管理"
+        echo -e "  ${GREEN}4.${NC}  🛠️  系统工具 - 系统资源、进程、日志管理"
+        echo -e "  ${GREEN}5.${NC}  📁 文件管理 - 文件搜索、内容查询、权限管理"
+        echo -e "  ${GREEN}6.${NC}  🕵️  抓包管理 - 网络数据包捕获与分析"
+        echo -e "  ${GREEN}7.${NC}  🔑 权限管理 - 切换用户权限"
+        echo "  0. 🚪 退出 - 退出工具"
         echo ""
-        read -ep "请选择操作 [0-6]: " choice
+        read -ep "请选择操作 [0-7]: " choice
 
         case $choice in
             1)
@@ -1072,6 +1528,9 @@ interactive_menu() {
                 capture_management
                 read -ep "按Enter键返回菜单..." dummy
                 ;;
+            7)
+                permission_management "$@"
+                ;;
             0)
                 echo ""
                 log_info "感谢使用通用Linux自动化工具集"
@@ -1079,7 +1538,7 @@ interactive_menu() {
                 exit 0
                 ;;
             *)
-                log_warning "无效选择，请输入 0-5"
+                log_warning "无效选择，请输入 0-7"
                 sleep 1
                 ;;
         esac
@@ -1114,11 +1573,12 @@ main() {
                 exit 0
                 ;;
             --help|-h)
-                echo "使用方法: sudo ./linux-tools.sh [选项]"
+                echo "使用方法: ./linux-tools.sh [选项]"
                 echo ""
                 echo "选项:"
                 echo "  --version, -v    显示版本信息"
                 echo "  --help, -h       显示帮助信息"
+                echo "  --sudo, -s       使用sudo权限运行"
                 echo ""
                 echo "主菜单功能:"
                 echo "  1. 查询系统信息"
@@ -1127,17 +1587,20 @@ main() {
                 echo "  4. 系统工具"
                 echo "  5. 文件管理"
                 echo "  6. 抓包管理"
+                echo "  7. 权限管理"
                 echo "  0. 退出"
                 exit 0
+                ;;
+            --sudo|-s)
+                log_info "正在使用sudo权限运行..."
+                exec sudo "$0" "${@:2}"
                 ;;
         esac
     fi
 
-    # 检查root权限
-    if [ "$(id -u)" -ne 0 ]; then
-        log_warning "部分功能需要root权限，建议使用sudo运行"
-        echo ""
-    fi
+    # 检查当前权限
+    check_permission
+    echo ""
 
     interactive_menu
 }
