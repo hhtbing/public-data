@@ -592,7 +592,6 @@ save_reverse_proxy_mode() {
 }
 
 # 交互式选择反向代理模式（部署时调用）
-# 选"使用反向代理"时，弹出 Range 头配置说明和菜单
 prompt_reverse_proxy_mode() {
     local CURRENT_MODE=$(get_reverse_proxy_mode)
 
@@ -605,7 +604,7 @@ prompt_reverse_proxy_mode() {
     echo ""
     echo -e "  ${GREEN}[Y] 使用反向代理（推荐/默认）${NC}"
     echo "     HTTP固件端口绑定 127.0.0.1，仅 Nginx 可访问"
-    echo "     设备通过 Nginx 反代下载固件（HTTPS + 域名）"
+    echo "     设备通过 Nginx 域名下载固件（TCP=HTTP, MQTT=HTTPS）"
     echo "     适用: 已配置 Nginx/宝塔反向代理的服务器"
     echo ""
     echo -e "  ${YELLOW}[n] 不使用反向代理${NC}"
@@ -628,47 +627,9 @@ prompt_reverse_proxy_mode() {
         return 0
     fi
 
-    # ── 使用反向代理：弹出 Range 头说明 + 配置菜单 ──────────────────────────
     save_reverse_proxy_mode "yes"
     log_info "已选择: 使用反向代理 (HTTP固件端口绑定 127.0.0.1)"
-
-    echo ""
-    echo "========================================="
-    echo -e "  ${CYAN}⚡ 关于 Nginx Range 头与 OTA 进度条${NC}"
-    echo "========================================="
-    echo ""
-    echo -e "  ${CYAN}问题：${NC}使用 Nginx 反向代理时，Nginx 默认会剥离 ESP32 发送的"
-    echo "  Range 头（bytes=N-M），导致 Go 服务端无法实时追踪下载进度。"
-    echo ""
-    echo "  📊 两种效果对比:"
-    echo ""
-    echo -e "  ${YELLOW}❌ 未配置 Range 透传（Nginx 默认行为）:${NC}"
-    echo "     P1进度条: 0% ─────────────────────────→ 100%  (直接跳变)"
-    echo "     ESP32共发出 268 个 Range 请求，Go 只收到 1 次整体请求"
-    echo "     进度追踪: Safety Net 估算（downloading → 完成 瞬间跳变）"
-    echo ""
-    echo -e "  ${GREEN}✅ 配置 Range 透传后（推荐）:${NC}"
-    echo "     P1进度条: 0→1→2→3→...→99→100%  (实时平滑递增)"
-    echo "     每个 Range 请求都到达 Go → Write() 逐块实时更新进度"
-    echo "     与本地直连服务器效果完全一致"
-    echo ""
-    echo "  🔧 方案：在 Nginx /firmware location 块内添加 4 行配置:"
-    echo ""
-    echo -e "  ${GREEN}    proxy_set_header Range \$http_range;${NC}"
-    echo -e "  ${GREEN}    proxy_set_header If-Range \$http_if_range;${NC}"
-    echo -e "  ${GREEN}    proxy_buffering off;${NC}"
-    echo -e "  ${GREEN}    proxy_cache off;${NC}"
-    echo ""
-    echo "  ⚠️  注意: proxy_buffering off 会禁用 Nginx 对该路径的缓冲，"
-    echo "     每次 Range 请求均实时转发到 Go——少量设备并发时影响可忽略。"
-    echo ""
-    read -ep "  是否现在配置 Nginx Range 头透传? [Y/n]: " range_now
-    if [[ ! "$range_now" =~ ^[Nn]$ ]]; then
-        menu_nginx_range
-    else
-        echo ""
-        log_info "已跳过，部署完成后可通过菜单 [15] 配置 Nginx Range 头透传"
-    fi
+    log_info "菜单 1 将自动复位并验证 HTTP 例外、/firmware 反代及 Range 透传"
 }
 
 # 自动检测并配置 Nginx Range 头透传
@@ -1118,6 +1079,429 @@ menu_firmware_domain() {
 
 # 全局变量: 交互式 resolve 后存储结果（避免子 shell 吞掉交互输出）
 _NGINX_CONF_PATH=""
+_DEPLOY_NGINX_CONF_PATH=""
+LAST_NGINX_BACKUP_PATH=""
+
+count_fixed_line() {
+    local pattern="$1"
+    local file="$2"
+    grep -F -c "$pattern" "$file" 2>/dev/null || true
+}
+
+# 部署模式只允许按固件域名匹配站点，禁止误改其他含 firmware 的网站。
+resolve_nginx_conf_for_domain() {
+    local domain="$1"
+    local path
+    [ -n "$domain" ] || return 1
+
+    local fixed_paths=(
+        "/www/server/panel/vhost/nginx/${domain}.conf"
+        "/etc/nginx/conf.d/${domain}.conf"
+        "/etc/nginx/sites-available/${domain}"
+        "/etc/nginx/sites-enabled/${domain}"
+        "/opt/1panel/core/apps/openresty/openresty/conf.d/${domain}.conf"
+    )
+    for path in "${fixed_paths[@]}"; do
+        if [ -f "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_nginx_firmware_layout() {
+    local file="$1"
+    local http_start http_end proxy_end redirect_guard
+    local managed_http_start managed_http_end managed_proxy_start managed_proxy_end
+
+    [ -f "$file" ] || {
+        log_error "Nginx 配置文件不存在: $file"
+        return 1
+    }
+
+    http_start=$(count_fixed_line "#HTTP_TO_HTTPS_START" "$file")
+    http_end=$(count_fixed_line "#HTTP_TO_HTTPS_END" "$file")
+    proxy_end=$(count_fixed_line "#PROXY-CONF-END" "$file")
+    redirect_guard=$(grep -E -c '^[[:space:]]*if[[:space:]]*\([[:space:]]*\$isRedcert[[:space:]]*!=[[:space:]]*1[[:space:]]*\)' "$file" 2>/dev/null || true)
+    managed_http_start=$(count_fixed_line "# OTA-QL-FIRMWARE-HTTP-START" "$file")
+    managed_http_end=$(count_fixed_line "# OTA-QL-FIRMWARE-HTTP-END" "$file")
+    managed_proxy_start=$(count_fixed_line "# OTA-QL-FIRMWARE-PROXY-START" "$file")
+    managed_proxy_end=$(count_fixed_line "# OTA-QL-FIRMWARE-PROXY-END" "$file")
+
+    if [ "$http_start" -ne 1 ] || [ "$http_end" -ne 1 ] || [ "$proxy_end" -ne 1 ] || [ "$redirect_guard" -ne 1 ]; then
+        log_error "不支持的 Nginx 布局: 需要唯一的宝塔 HTTP 强制 HTTPS 区域、isRedcert 跳转判断和 #PROXY-CONF-END"
+        return 1
+    fi
+    if [ "$managed_http_start" -ne "$managed_http_end" ] || [ "$managed_http_start" -gt 1 ]; then
+        log_error "Nginx 中 OTA-QL HTTP 托管标记不完整或重复"
+        return 1
+    fi
+    if [ "$managed_proxy_start" -ne "$managed_proxy_end" ] || [ "$managed_proxy_start" -gt 1 ]; then
+        log_error "Nginx 中 OTA-QL /firmware 托管标记不完整或重复"
+        return 1
+    fi
+    return 0
+}
+
+validate_normalized_nginx_firmware_config() {
+    local file="$1"
+    validate_nginx_firmware_layout "$file" || return 1
+
+    [ "$(count_fixed_line "# OTA-QL-FIRMWARE-HTTP-START" "$file")" -eq 1 ] || return 1
+    [ "$(count_fixed_line "# OTA-QL-FIRMWARE-PROXY-START" "$file")" -eq 1 ] || return 1
+    [ "$(count_fixed_line "location ^~ /firmware {" "$file")" -eq 1 ] || return 1
+    grep -F -q 'proxy_pass http://127.0.0.1:10089/firmware;' "$file" || return 1
+    grep -F -q 'proxy_set_header Range $http_range;' "$file" || return 1
+    grep -F -q 'proxy_set_header If-Range $http_if_range;' "$file" || return 1
+    grep -F -q 'proxy_buffering off;' "$file" || return 1
+    grep -F -q 'proxy_cache off;' "$file" || return 1
+}
+
+# 纯配置转换函数：输入和输出分离，供部署事务与离线夹具测试共用。
+normalize_nginx_firmware_config() {
+    local input="$1"
+    local output="$2"
+    validate_nginx_firmware_layout "$input" || return 1
+
+    awk '
+        function brace_delta(text,    opens, closes, tmp) {
+            tmp = text
+            opens = gsub(/\{/, "", tmp)
+            tmp = text
+            closes = gsub(/\}/, "", tmp)
+            return opens - closes
+        }
+        function print_http_block() {
+            print "    # OTA-QL-FIRMWARE-HTTP-START"
+            print "    if ( $uri ~ ^/firmware(/|$) ) {"
+            print "        set $isRedcert 1;"
+            print "    }"
+            print "    # OTA-QL-FIRMWARE-HTTP-END"
+        }
+        function print_proxy_block() {
+            print "    # OTA-QL-FIRMWARE-PROXY-START"
+            print "    location ^~ /firmware {"
+            print "        proxy_pass http://127.0.0.1:10089/firmware;"
+            print "        proxy_set_header Host $http_host;"
+            print "        proxy_set_header X-Real-IP $remote_addr;"
+            print "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"
+            print "        proxy_set_header X-Forwarded-Proto $scheme;"
+            print "        proxy_set_header Range $http_range;"
+            print "        proxy_set_header If-Range $http_if_range;"
+            print "        proxy_buffering off;"
+            print "        proxy_cache off;"
+            print "        proxy_connect_timeout 60s;"
+            print "        proxy_send_timeout 600s;"
+            print "        proxy_read_timeout 600s;"
+            print "    }"
+            print "    # OTA-QL-FIRMWARE-PROXY-END"
+        }
+        function finish_if_buffer() {
+            if (!(if_buffer ~ /\/firmware/ && if_buffer ~ /isRedcert/)) {
+                printf "%s", if_buffer
+            }
+            if_buffer = ""
+            capture_if = 0
+            if_depth = 0
+        }
+        BEGIN {
+            in_http = 0
+            http_inserted = 0
+            skip_http_managed = 0
+            skip_proxy_managed = 0
+            skip_firmware_location = 0
+            capture_if = 0
+        }
+        {
+            line = $0
+
+            if (skip_http_managed) {
+                if (line ~ /# OTA-QL-FIRMWARE-HTTP-END/) {
+                    skip_http_managed = 0
+                }
+                next
+            }
+            if (skip_proxy_managed) {
+                if (line ~ /# OTA-QL-FIRMWARE-PROXY-END/) {
+                    skip_proxy_managed = 0
+                }
+                next
+            }
+            if (skip_firmware_location) {
+                location_depth += brace_delta(line)
+                if (location_depth <= 0) {
+                    skip_firmware_location = 0
+                }
+                next
+            }
+            if (capture_if) {
+                if_buffer = if_buffer line ORS
+                if_depth += brace_delta(line)
+                if (if_depth <= 0) {
+                    finish_if_buffer()
+                }
+                next
+            }
+
+            if (line ~ /#HTTP_TO_HTTPS_START/) {
+                print line
+                in_http = 1
+                next
+            }
+            if (line ~ /#HTTP_TO_HTTPS_END/) {
+                in_http = 0
+                print line
+                next
+            }
+            if (in_http && line ~ /# OTA-QL-FIRMWARE-HTTP-START/) {
+                skip_http_managed = 1
+                next
+            }
+            if (in_http && line ~ /^[[:space:]]*if[[:space:]]*\([[:space:]]*\$isRedcert[[:space:]]*!=[[:space:]]*1[[:space:]]*\)/) {
+                print_http_block()
+                http_inserted++
+            }
+            if (in_http && line ~ /^[[:space:]]*if[[:space:]]*\(/) {
+                capture_if = 1
+                if_buffer = line ORS
+                if_depth = brace_delta(line)
+                if (if_depth <= 0) {
+                    finish_if_buffer()
+                }
+                next
+            }
+            if (line ~ /# OTA-QL-FIRMWARE-PROXY-START/) {
+                skip_proxy_managed = 1
+                next
+            }
+            if (line ~ /^[[:space:]]*location[[:space:]]+/ && line ~ /\/firmware/) {
+                skip_firmware_location = 1
+                location_depth = brace_delta(line)
+                if (location_depth <= 0) {
+                    skip_firmware_location = 0
+                }
+                next
+            }
+            if (line ~ /#PROXY-CONF-END/) {
+                print_proxy_block()
+                print line
+                next
+            }
+            print line
+        }
+        END {
+            if (skip_http_managed || skip_proxy_managed || skip_firmware_location || capture_if || in_http || http_inserted != 1) {
+                exit 2
+            }
+        }
+    ' "$input" >"$output" || {
+        rm -f "$output"
+        log_error "生成 Nginx /firmware 托管配置失败"
+        return 1
+    }
+
+    if ! validate_normalized_nginx_firmware_config "$output"; then
+        rm -f "$output"
+        log_error "生成后的 Nginx /firmware 配置结构校验失败"
+        return 1
+    fi
+}
+
+rollback_nginx_firmware_config() {
+    local conf="$1"
+    local backup="$2"
+    local nginx_bin="${NGINX_BIN:-nginx}"
+
+    cp -pf "$backup" "$conf" || return 1
+    if ! "$nginx_bin" -t; then
+        log_error "已恢复 Nginx 备份，但恢复后的 nginx -t 仍失败: $backup"
+        return 1
+    fi
+    "$nginx_bin" -s reload || {
+        log_error "已恢复 Nginx 备份，但重载失败: $backup"
+        return 1
+    }
+    log_warning "已恢复 Nginx 配置备份: $backup"
+}
+
+apply_nginx_firmware_config() {
+    local requested_conf="$1"
+    local conf
+    local nginx_bin="${NGINX_BIN:-nginx}"
+    local stamp backup temp
+
+    conf=$(readlink -f "$requested_conf" 2>/dev/null || echo "$requested_conf")
+    validate_nginx_firmware_layout "$conf" || return 1
+    stamp=$(date +%Y%m%d_%H%M%S)
+    backup="${conf}.ota-ql.bak.${stamp}"
+    temp=$(mktemp "${conf}.ota-ql.tmp.XXXXXX") || return 1
+
+    if ! cp -p "$conf" "$backup"; then
+        rm -f "$temp"
+        log_error "无法备份 Nginx 配置: $backup"
+        return 1
+    fi
+    LAST_NGINX_BACKUP_PATH="$backup"
+    log_info "Nginx 配置备份: $backup"
+
+    if ! normalize_nginx_firmware_config "$conf" "$temp"; then
+        rm -f "$temp"
+        return 1
+    fi
+    chmod --reference="$conf" "$temp" 2>/dev/null || true
+    chown --reference="$conf" "$temp" 2>/dev/null || true
+    if ! mv -f "$temp" "$conf"; then
+        rm -f "$temp"
+        log_error "无法替换 Nginx 配置: $conf"
+        return 1
+    fi
+
+    if ! "$nginx_bin" -t; then
+        log_error "nginx -t 失败，正在恢复备份"
+        rollback_nginx_firmware_config "$conf" "$backup" || true
+        return 1
+    fi
+    if ! "$nginx_bin" -s reload; then
+        log_error "Nginx 重载失败，正在恢复备份"
+        rollback_nginx_firmware_config "$conf" "$backup" || true
+        return 1
+    fi
+
+    log_success "Nginx /firmware 托管配置已恢复"
+    return 0
+}
+
+verify_range_response() {
+    local label="$1"
+    local url="$2"
+    local resolve_entry="${3:-}"
+    local headers body status bytes
+    local curl_args=(-sS -k --connect-timeout 10 --max-time 60)
+
+    headers=$(mktemp) || return 1
+    body=$(mktemp) || {
+        rm -f "$headers"
+        return 1
+    }
+    [ -z "$resolve_entry" ] || curl_args+=(--resolve "$resolve_entry")
+
+    status=$(curl "${curl_args[@]}" -D "$headers" -o "$body" -w '%{http_code}' \
+        -H 'Range: bytes=0-99' "$url" 2>/dev/null || true)
+    bytes=$(wc -c <"$body" | tr -d ' ')
+    if [ "$status" != "206" ] || ! tr -d '\r' <"$headers" | grep -qiE '^Content-Range: bytes 0-99/[0-9]+$' || [ "$bytes" != "100" ]; then
+        log_error "${label} Range 验证失败: URL=${url} expected=status:206,range:0-99,bytes:100 actual=status:${status:-curl_error},bytes:${bytes}"
+        rm -f "$headers" "$body"
+        return 1
+    fi
+    rm -f "$headers" "$body"
+    log_success "${label} Range 验证通过 (206, 100 bytes)"
+}
+
+verify_http_redirect() {
+    local domain="$1"
+    local headers status location
+    headers=$(mktemp) || return 1
+    status=$(curl -sS --connect-timeout 10 --max-time 30 --resolve "${domain}:80:127.0.0.1" \
+        -D "$headers" -o /dev/null -w '%{http_code}' "http://${domain}/" 2>/dev/null || true)
+    location=$(tr -d '\r' <"$headers" | sed -n 's/^[Ll]ocation:[[:space:]]*//p' | tail -1)
+    rm -f "$headers"
+
+    case "$status" in
+        301|302|307|308) ;;
+        *)
+            log_error "HTTP 根路径重定向验证失败: expected=301/302/307/308 actual=${status:-curl_error}"
+            return 1
+            ;;
+    esac
+    case "$location" in
+        "https://${domain}"*) ;;
+        *)
+            log_error "HTTP 根路径 Location 验证失败: expected=https://${domain} actual=${location:-missing}"
+            return 1
+            ;;
+    esac
+    log_success "HTTP 根路径仍正常跳转 HTTPS"
+}
+
+verify_nginx_firmware_behavior() {
+    local domain="$1"
+    local probe_file=""
+    local created_probe="false"
+    local candidate base url_path
+
+    while IFS= read -r candidate; do
+        base=$(basename "$candidate")
+        if [[ "$base" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            probe_file="$candidate"
+            break
+        fi
+    done < <(find "$FIRMWARE_DIR" -maxdepth 1 -type f -size +99c 2>/dev/null | sort)
+
+    if [ -z "$probe_file" ]; then
+        probe_file="${FIRMWARE_DIR}/.ota-ql-range-probe-$$.bin"
+        if ! dd if=/dev/zero of="$probe_file" bs=128 count=1 status=none; then
+            log_error "无法创建 Range 验证文件: $probe_file"
+            return 1
+        fi
+        created_probe="true"
+    fi
+    url_path=$(basename "$probe_file")
+
+    local result=0
+    verify_http_redirect "$domain" || result=1
+    if [ "$result" -eq 0 ]; then
+        verify_range_response "HTTP /firmware" "http://${domain}/firmware/${url_path}" "${domain}:80:127.0.0.1" || result=1
+    fi
+    if [ "$result" -eq 0 ]; then
+        verify_range_response "HTTPS /firmware" "https://${domain}/firmware/${url_path}" "${domain}:443:127.0.0.1" || result=1
+    fi
+    if [ "$result" -eq 0 ]; then
+        verify_range_response "直连 10089" "http://127.0.0.1:${HTTP_FW_PORT}/firmware/${url_path}" || result=1
+    fi
+
+    [ "$created_probe" != "true" ] || rm -f "$probe_file"
+    return "$result"
+}
+
+validate_nginx_deployment_prerequisites() {
+    local domain conf
+    domain=$(get_firmware_domain)
+    if [ -z "$domain" ]; then
+        log_error "生产反向代理模式必须先配置固件下载域名"
+        return 1
+    fi
+    conf=$(resolve_nginx_conf_for_domain "$domain" || true)
+    if [ -z "$conf" ]; then
+        log_error "未找到域名 ${domain} 的 Nginx 站点配置，部署已停止"
+        return 1
+    fi
+    validate_nginx_firmware_layout "$conf" || return 1
+    _DEPLOY_NGINX_CONF_PATH="$conf"
+    log_success "已确认 Nginx 站点配置: $conf"
+}
+
+apply_and_verify_nginx_firmware_config() {
+    local domain conf backup
+    domain=$(get_firmware_domain)
+    conf="$_DEPLOY_NGINX_CONF_PATH"
+    if [ -z "$conf" ]; then
+        conf=$(resolve_nginx_conf_for_domain "$domain" || true)
+    fi
+    [ -n "$conf" ] || {
+        log_error "无法解析固件域名对应的 Nginx 配置"
+        return 1
+    }
+
+    apply_nginx_firmware_config "$conf" || return 1
+    backup="$LAST_NGINX_BACKUP_PATH"
+    if ! verify_nginx_firmware_behavior "$domain"; then
+        log_error "固件反代行为验证失败，正在回滚 Nginx"
+        rollback_nginx_firmware_config "$conf" "$backup" || true
+        return 1
+    fi
+    log_success "HTTP/HTTPS /firmware Range 行为验证全部通过"
+}
 
 # 非交互式自动查找 Nginx 配置文件（用于状态显示等场景）
 # 优先级: 按域名固定路径 → 搜索含 /firmware 的 .conf 文件
@@ -4117,6 +4501,14 @@ deploy_container() {
         return 1
     fi
 
+    local RP_MODE=$(get_reverse_proxy_mode)
+    if [ "$mode" = "production" ] && [ "$RP_MODE" = "yes" ]; then
+        if ! validate_nginx_deployment_prerequisites; then
+            log_error "Nginx 固件反代前置校验失败，未停止现有容器"
+            return 1
+        fi
+    fi
+
     backup_current_image
     stop_old_container
 
@@ -4128,6 +4520,13 @@ deploy_container() {
     save_deploy_mode "$mode"
 
     if health_check; then
+        if [ "$mode" = "production" ] && [ "$RP_MODE" = "yes" ]; then
+            if ! apply_and_verify_nginx_firmware_config; then
+                log_error "Nginx 固件反代复位或验证失败，本次部署不标记为成功"
+                return 1
+            fi
+        fi
+
         cleanup_old_images
         show_initial_password "$IS_FIRST"
         show_container_status
@@ -5144,5 +5543,7 @@ main() {
     interactive_menu
 }
 
-# 脚本入口
-main "$@"
+# 脚本入口（被测试脚本 source 时不启动交互菜单）
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
