@@ -48,6 +48,8 @@ DEPLOY_MODE_FILE="${DATA_DIR}/.deploy_mode"
 MQTT_ADDR_FILE="${DATA_DIR}/.mqtt_addr"
 FIRMWARE_DOMAIN_FILE="${DATA_DIR}/.firmware_domain"
 REVERSE_PROXY_FILE="${DATA_DIR}/.reverse_proxy"
+CERT_SYNC_SOURCE_FILE="${DATA_DIR}/.cert_sync_source"
+CERT_SYNC_CRON_MARKER="# OTA-QL-CERT-SYNC"
 BACKUP_BASE_DIR="/backup/ota-ql"
 BACKUP_LIST_FILE="${BACKUP_BASE_DIR}/.backup_list"
 
@@ -2119,7 +2121,132 @@ deploy_cert_to_ota() {
     fi
     echo ""
 
+    # 菜单 1 重部署时需要知道原始证书位置，才能在面板续期后同步到容器。
+    # 仅保存路径，不复制或记录私钥内容。
+    printf '%s\n%s\n' "$src_cert" "$src_key" | sudo tee "${CERT_SYNC_SOURCE_FILE}" > /dev/null
+    sudo chmod 600 "${CERT_SYNC_SOURCE_FILE}"
+
     return 0
+}
+
+# 读取上次成功部署时记录的证书来源。返回值为 0 时设置全局 source_cert/source_key。
+load_cert_sync_source() {
+    local source_cert=""
+    local source_key=""
+
+    if [ -r "${CERT_SYNC_SOURCE_FILE}" ]; then
+        source_cert=$(sed -n '1p' "${CERT_SYNC_SOURCE_FILE}")
+        source_key=$(sed -n '2p' "${CERT_SYNC_SOURCE_FILE}")
+    fi
+
+    if [ -f "$source_cert" ] && [ -f "$source_key" ]; then
+        CERT_SYNC_SOURCE_CERT="$source_cert"
+        CERT_SYNC_SOURCE_KEY="$source_key"
+        return 0
+    fi
+    return 1
+}
+
+# 对升级脚本发布前已经存在的容器证书，按证书指纹反查常见面板/Certbot来源。
+discover_cert_sync_source() {
+    local deployed_cert="${CERTS_DIR}/fullchain.pem"
+    local target_fingerprint candidate candidate_fingerprint candidate_key
+
+    [ -f "$deployed_cert" ] || return 1
+    command -v openssl &> /dev/null || return 1
+    target_fingerprint=$(openssl x509 -in "$deployed_cert" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+    [ -n "$target_fingerprint" ] || return 1
+
+    while IFS= read -r -d '' candidate; do
+        candidate_fingerprint=$(openssl x509 -in "$candidate" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+        [ "$candidate_fingerprint" = "$target_fingerprint" ] || continue
+        candidate_key="$(dirname "$candidate")/privkey.pem"
+        [ -f "$candidate_key" ] || continue
+        CERT_SYNC_SOURCE_CERT="$candidate"
+        CERT_SYNC_SOURCE_KEY="$candidate_key"
+        printf '%s\n%s\n' "$candidate" "$candidate_key" | sudo tee "${CERT_SYNC_SOURCE_FILE}" > /dev/null
+        sudo chmod 600 "${CERT_SYNC_SOURCE_FILE}"
+        return 0
+    done < <(find /www/server/panel/vhost/cert /etc/letsencrypt/live -type f -name fullchain.pem -print0 2>/dev/null)
+
+    return 1
+}
+
+# 用户选择保留容器证书时，仅比较已记录/可反查的面板证书；不复制文件也不修改 cron。
+compare_available_cert_with_deployed() {
+    local deployed_cert="${CERTS_DIR}/fullchain.pem"
+    local source_cert="${CERT_SYNC_SOURCE_CERT:-}"
+    local deployed_fingerprint source_fingerprint deployed_expiry source_expiry deployed_epoch source_epoch
+
+    [ -f "$deployed_cert" ] || return 0
+    if [ -z "$source_cert" ] || [ ! -f "$source_cert" ]; then
+        load_cert_sync_source || discover_cert_sync_source || true
+        source_cert="${CERT_SYNC_SOURCE_CERT:-}"
+    fi
+
+    if [ ! -f "$source_cert" ] || ! command -v openssl &> /dev/null; then
+        log_warning "未找到可比较的面板证书来源，保留当前容器证书"
+        return 0
+    fi
+
+    deployed_fingerprint=$(openssl x509 -in "$deployed_cert" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+    source_fingerprint=$(openssl x509 -in "$source_cert" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+    deployed_expiry=$(openssl x509 -in "$deployed_cert" -noout -enddate 2>/dev/null | cut -d= -f2)
+    source_expiry=$(openssl x509 -in "$source_cert" -noout -enddate 2>/dev/null | cut -d= -f2)
+
+    echo ""
+    echo "  [保留证书检查]"
+    echo "  当前容器证书到期: ${deployed_expiry:-未知}"
+    echo "  面板来源证书到期: ${source_expiry:-未知}"
+    if [ -n "$deployed_fingerprint" ] && [ "$deployed_fingerprint" = "$source_fingerprint" ]; then
+        log_success "证书相同：面板与当前容器使用同一张证书，继续保留"
+        return 0
+    fi
+
+    deployed_epoch=$(date -d "$deployed_expiry" +%s 2>/dev/null || echo 0)
+    source_epoch=$(date -d "$source_expiry" +%s 2>/dev/null || echo 0)
+    if [ "$source_epoch" -gt "$deployed_epoch" ] 2>/dev/null; then
+        log_warning "面板证书更新：其到期时间更晚；当前按你的选择保留容器证书"
+    elif [ "$source_epoch" -lt "$deployed_epoch" ] 2>/dev/null; then
+        log_warning "当前容器证书到期时间更晚；继续保留当前容器证书"
+    else
+        log_warning "面板证书与当前容器证书不同，但到期时间相同；继续保留当前容器证书"
+    fi
+}
+
+# 菜单 1 的幂等证书同步：面板负责续期，此任务只在源证书更新后同步并重启 OTA 容器。
+ensure_cert_sync_cron() {
+    local source_cert="${CERT_SYNC_SOURCE_CERT:-}"
+    local source_key="${CERT_SYNC_SOURCE_KEY:-}"
+    local current_cron cron_cmd q_source_cert q_source_key q_dest_cert q_dest_key
+
+    if [ -z "$source_cert" ] || [ -z "$source_key" ]; then
+        load_cert_sync_source || discover_cert_sync_source || true
+        source_cert="${CERT_SYNC_SOURCE_CERT:-}"
+        source_key="${CERT_SYNC_SOURCE_KEY:-}"
+    fi
+
+    if [ ! -f "$source_cert" ] || [ ! -f "$source_key" ]; then
+        log_warning "未确认容器证书来源，未设置证书同步 cron（可在菜单 11 重新部署证书后再次运行菜单 1）"
+        return 0
+    fi
+
+    printf -v q_source_cert '%q' "$source_cert"
+    printf -v q_source_key '%q' "$source_key"
+    printf -v q_dest_cert '%q' "${CERTS_DIR}/fullchain.pem"
+    printf -v q_dest_key '%q' "${CERTS_DIR}/privkey.pem"
+    cron_cmd="0 4 * * * if [ ${q_source_cert} -nt ${q_dest_cert} ] || [ ${q_source_key} -nt ${q_dest_key} ]; then cp -f ${q_source_cert} ${q_dest_cert} && cp -f ${q_source_key} ${q_dest_key} && docker restart ${CONTAINER_NAME}; fi >> /var/log/cert-sync.log 2>&1 ${CERT_SYNC_CRON_MARKER}"
+
+    current_cron=$(sudo crontab -l 2>/dev/null || true)
+    # 同时替换旧版菜单 14 生成的无标识 cert-sync 任务，避免首次升级脚本后重复。
+    { printf '%s\n' "$current_cron" | grep -v -F "$CERT_SYNC_CRON_MARKER" | grep -v -F '>> /var/log/cert-sync.log 2>&1' || true; echo "$cron_cmd"; } | sudo crontab -
+
+    if [ $? -eq 0 ]; then
+        log_success "证书同步 cron 已验证并写入（每天 4:00，幂等替换）"
+    else
+        log_error "证书同步 cron 写入失败"
+        return 1
+    fi
 }
 
 # 部署时自动搜索并安装证书
@@ -4225,6 +4352,7 @@ deploy_cert_interactive_menu() {
         echo ""
         read -ep "是否重新配置证书? [y/N]: " reconfig
         if [[ ! "$reconfig" =~ ^[Yy]$ ]]; then
+            compare_available_cert_with_deployed
             log_info "保留现有证书，继续部署"
             return 0
         fi
@@ -4556,6 +4684,7 @@ deploy_container() {
             fi
         fi
 
+        ensure_cert_sync_cron
         cleanup_old_images
         show_initial_password "$IS_FIRST"
         show_container_status
