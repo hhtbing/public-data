@@ -1091,11 +1091,11 @@ count_fixed_line() {
 # 部署模式只允许按固件域名匹配站点，禁止误改其他含 firmware 的网站。
 resolve_nginx_conf_for_domain() {
     local domain="$1"
-    local path
+    local path dir candidate
     [ -n "$domain" ] || return 1
 
     local fixed_paths=(
-        "/www/server/panel/vhost/nginx/${domain}.conf"
+        "${NGINX_VHOST_DIR:-/www/server/panel/vhost/nginx}/${domain}.conf"
         "/etc/nginx/conf.d/${domain}.conf"
         "/etc/nginx/sites-available/${domain}"
         "/etc/nginx/sites-enabled/${domain}"
@@ -1106,6 +1106,35 @@ resolve_nginx_conf_for_domain() {
             echo "$path"
             return 0
         fi
+    done
+
+    # 宝塔常用 SAN 配置以其中一个域名命名，例如 ota.wisefido.work.conf
+    # 同时通过 server_name 提供 ota.wisefido.com；按精确 server_name 令牌回退查找。
+    local search_dirs=(
+        "${NGINX_VHOST_DIR:-/www/server/panel/vhost/nginx}"
+        "/etc/nginx/conf.d"
+        "/etc/nginx/sites-available"
+        "/etc/nginx/sites-enabled"
+        "/opt/1panel/core/apps/openresty/openresty/conf.d"
+    )
+    for dir in "${search_dirs[@]}"; do
+        [ -d "$dir" ] || continue
+        while IFS= read -r candidate; do
+            if awk -v domain="$domain" '
+                $1 == "server_name" {
+                    for (i = 2; i <= NF; i++) {
+                        gsub(";", "", $i)
+                        if ($i == domain) {
+                            found = 1
+                        }
+                    }
+                }
+                END { exit(found ? 0 : 1) }
+            ' "$candidate"; then
+                echo "$candidate"
+                return 0
+            fi
+        done < <(find "$dir" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null | sort)
     done
     return 1
 }
