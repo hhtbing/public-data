@@ -658,7 +658,10 @@ auto_configure_nginx_range() {
 
     # 检查是否已配置 Range 头透传
     if grep -q "proxy_set_header Range" "$NGINX_CONF"; then
+        echo ""
+        echo "[Nginx OTA进度]"
         log_success "Nginx Range 头透传已配置 ✓"
+        log_info "将保留现有配置，并在部署完成后验证 HTTP/HTTPS Range 行为"
         return 0
     fi
 
@@ -1080,6 +1083,24 @@ count_fixed_line() {
     grep -F -c "$pattern" "$file" 2>/dev/null || true
 }
 
+nginx_conf_declares_domain() {
+    local file="$1"
+    local domain="$2"
+
+    [ -f "$file" ] && [ -n "$domain" ] || return 1
+    awk -v domain="$domain" '
+        $1 == "server_name" {
+            for (i = 2; i <= NF; i++) {
+                gsub(";", "", $i)
+                if ($i == domain) {
+                    found = 1
+                }
+            }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$file"
+}
+
 # 部署模式只允许按固件域名匹配站点，禁止误改其他含 firmware 的网站。
 resolve_nginx_conf_for_domain() {
     local domain="$1"
@@ -1094,7 +1115,7 @@ resolve_nginx_conf_for_domain() {
         "/opt/1panel/core/apps/openresty/openresty/conf.d/${domain}.conf"
     )
     for path in "${fixed_paths[@]}"; do
-        if [ -f "$path" ]; then
+        if nginx_conf_declares_domain "$path" "$domain"; then
             echo "$path"
             return 0
         fi
@@ -1112,17 +1133,7 @@ resolve_nginx_conf_for_domain() {
     for dir in "${search_dirs[@]}"; do
         [ -d "$dir" ] || continue
         while IFS= read -r candidate; do
-            if awk -v domain="$domain" '
-                $1 == "server_name" {
-                    for (i = 2; i <= NF; i++) {
-                        gsub(";", "", $i)
-                        if ($i == domain) {
-                            found = 1
-                        }
-                    }
-                }
-                END { exit(found ? 0 : 1) }
-            ' "$candidate"; then
+            if nginx_conf_declares_domain "$candidate" "$domain"; then
                 echo "$candidate"
                 return 0
             fi
@@ -1567,46 +1578,12 @@ apply_and_verify_nginx_firmware_config() {
 }
 
 # 非交互式自动查找 Nginx 配置文件（用于状态显示等场景）
-# 优先级: 按域名固定路径 → 搜索含 /firmware 的 .conf 文件
+# 仅按当前固件域名解析站点，禁止回退到其他项目的 /firmware 配置。
 find_nginx_conf() {
     local FW_DOMAIN=$(get_firmware_domain)
 
-    # 1. 按域名固定路径查找
-    if [ -n "$FW_DOMAIN" ]; then
-        local FIXED_PATHS=(
-            "/www/server/panel/vhost/nginx/${FW_DOMAIN}.conf"
-            "/etc/nginx/conf.d/${FW_DOMAIN}.conf"
-            "/etc/nginx/sites-available/${FW_DOMAIN}"
-            "/etc/nginx/sites-enabled/${FW_DOMAIN}"
-            "/opt/1panel/core/apps/openresty/openresty/conf.d/${FW_DOMAIN}.conf"
-        )
-        for path in "${FIXED_PATHS[@]}"; do
-            if [ -f "$path" ]; then
-                echo "$path"
-                return 0
-            fi
-        done
-    fi
-
-    # 2. 搜索常见目录中含 /firmware 的 .conf 文件（不交互）
-    local SEARCH_DIRS=(
-        "/www/server/panel/vhost/nginx"
-        "/etc/nginx/conf.d"
-        "/etc/nginx/sites-enabled"
-        "/opt/1panel/core/apps/openresty/openresty/conf.d"
-    )
-    for dir in "${SEARCH_DIRS[@]}"; do
-        [ -d "$dir" ] || continue
-        local found
-        found=$(grep -rl "firmware" "$dir" --include="*.conf" 2>/dev/null | head -1)
-        if [ -n "$found" ]; then
-            echo "$found"
-            return 0
-        fi
-    done
-
-    echo ""
-    return 1
+    [ -n "$FW_DOMAIN" ] || return 1
+    resolve_nginx_conf_for_domain "$FW_DOMAIN"
 }
 
 # 交互式解析 Nginx 配置文件路径
@@ -1624,59 +1601,9 @@ resolve_nginx_conf_interactive() {
         return 0
     fi
 
-    # 2. 在常见 Nginx 目录中搜索所有 .conf 文件
-    log_info "自动搜索 Nginx 配置文件中..."
-    local SEARCH_DIRS=(
-        "/www/server/panel/vhost/nginx"
-        "/etc/nginx/conf.d"
-        "/etc/nginx/sites-available"
-        "/etc/nginx/sites-enabled"
-        "/opt/1panel/core/apps/openresty/openresty/conf.d"
-    )
-    local FOUND_FILES=()
-    for dir in "${SEARCH_DIRS[@]}"; do
-        [ -d "$dir" ] || continue
-        while IFS= read -r f; do
-            FOUND_FILES+=("$f")
-        done < <(find "$dir" -maxdepth 1 -type f 2>/dev/null | sort)
-    done
-
-    if [ ${#FOUND_FILES[@]} -gt 0 ]; then
-        echo ""
-        echo -e "  搜索到以下 Nginx 配置文件，请选择含 ${CYAN}/firmware${NC} 反代配置的文件:"
-        echo ""
-        for i in "${!FOUND_FILES[@]}"; do
-            local tag=""
-            grep -q "firmware" "${FOUND_FILES[$i]}" 2>/dev/null && tag="${GREEN} ← 含 /firmware${NC}"
-            echo -e "    [$((i+1))] ${FOUND_FILES[$i]}${tag}"
-        done
-    else
-        log_warning "在常见目录未搜索到 Nginx .conf 文件"
-    fi
-    echo "    [0] 手动输入完整路径"
-    echo ""
-
-    local max_sel=${#FOUND_FILES[@]}
-    read -ep "  请选择 [0-${max_sel}]: " sel
-
-    if [ "$sel" = "0" ] || [ ${#FOUND_FILES[@]} -eq 0 ]; then
-        read -ep "  请输入 Nginx 配置文件完整路径: " manual_path
-        if [ -f "$manual_path" ]; then
-            _NGINX_CONF_PATH="$manual_path"
-            log_success "使用配置文件: $manual_path"
-            return 0
-        else
-            log_error "文件不存在: $manual_path"
-            return 1
-        fi
-    elif [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$max_sel" ]; then
-        _NGINX_CONF_PATH="${FOUND_FILES[$((sel-1))]}"
-        log_success "已选择: $_NGINX_CONF_PATH"
-        return 0
-    else
-        log_warning "无效选择"
-        return 1
-    fi
+    log_error "未找到与固件域名 $(get_firmware_domain) 精确匹配的 Nginx 站点"
+    log_info "为保护其他项目，菜单 15 不会列出或修改非当前域名的站点配置"
+    return 1
 }
 
 # 配置 Nginx Range 头透传
@@ -2109,12 +2036,10 @@ deploy_cert_to_ota() {
 
     # 验证证书和私钥匹配
     if command -v openssl &> /dev/null; then
-        local cert_md5=$(openssl x509 -in "$src_cert" -noout -modulus 2>/dev/null | openssl md5 2>/dev/null)
-        local key_md5=$(openssl rsa -in "$src_key" -noout -modulus 2>/dev/null | openssl md5 2>/dev/null)
-        if [ -n "$cert_md5" ] && [ -n "$key_md5" ] && [ "$cert_md5" != "$key_md5" ]; then
+        local cert_pubkey=$(openssl x509 -in "$src_cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+        local key_pubkey=$(openssl pkey -in "$src_key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
+        if [ -z "$cert_pubkey" ] || [ -z "$key_pubkey" ] || [ "$cert_pubkey" != "$key_pubkey" ]; then
             log_error "证书和私钥不匹配！"
-            echo "  证书modulus MD5: $cert_md5"
-            echo "  私钥modulus MD5: $key_md5"
             return 1
         fi
         log_success "证书和私钥验证匹配"
@@ -2159,6 +2084,34 @@ deploy_cert_to_ota() {
     sudo chmod 600 "${CERT_SYNC_SOURCE_FILE}"
 
     return 0
+}
+
+sync_nginx_certificate_to_ota() {
+    local domain conf cert key deployed_fingerprint nginx_fingerprint
+
+    domain=$(get_firmware_domain)
+    [ -n "$domain" ] || return 0
+    conf=$(resolve_nginx_conf_for_domain "$domain" || true)
+    [ -n "$conf" ] || return 0
+
+    cert=$(awk '$1 == "ssl_certificate" { gsub(/;/, "", $2); print $2; exit }' "$conf")
+    key=$(awk '$1 == "ssl_certificate_key" { gsub(/;/, "", $2); print $2; exit }' "$conf")
+    if [ ! -f "$cert" ] || [ ! -f "$key" ]; then
+        log_warning "未从 Nginx 站点解析到可用的 TLS 证书，保留容器当前证书"
+        return 0
+    fi
+
+    nginx_fingerprint=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+    deployed_fingerprint=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+    if [ -n "$nginx_fingerprint" ] && [ "$nginx_fingerprint" = "$deployed_fingerprint" ]; then
+        log_success "容器 TLS 证书与 Nginx 证书一致 ✓"
+        return 0
+    fi
+
+    echo ""
+    log_warning "检测到容器 TLS 证书与 Nginx 站点证书不一致，正在同步"
+    deploy_cert_to_ota "$cert" "$key" "Nginx站点 ${domain}" || return 1
+    log_success "容器 TLS 证书已同步为 Nginx 当前证书"
 }
 
 # 读取上次成功部署时记录的证书来源。返回值为 0 时设置全局 source_cert/source_key。
@@ -4683,6 +4636,13 @@ deploy_container() {
     # v9.0: 交互式设置反向代理模式（影响HTTP固件端口绑定 + Nginx Range头自动配置）
     prompt_reverse_proxy_mode
 
+    local RP_MODE=$(get_reverse_proxy_mode)
+    if [ "$mode" = "production" ] && [ "$RP_MODE" = "yes" ]; then
+        # 在 SSL 菜单前明确显示 OTA 进度状态，并同步 Nginx 的当前证书。
+        auto_configure_nginx_range
+        sync_nginx_certificate_to_ota || return 1
+    fi
+
     # v5.3: SSL证书配置（交互式菜单，含覆盖检查+SAN/通配符申请）
     deploy_cert_interactive_menu
 
@@ -4690,10 +4650,7 @@ deploy_container() {
         return 1
     fi
 
-    local RP_MODE=$(get_reverse_proxy_mode)
     if [ "$mode" = "production" ] && [ "$RP_MODE" = "yes" ]; then
-        # 缺少 Range 头时在停止旧容器前提示并完成安全注入。
-        auto_configure_nginx_range
         if ! validate_nginx_deployment_prerequisites; then
             log_error "Nginx 固件反代前置校验失败，未停止现有容器"
             return 1
