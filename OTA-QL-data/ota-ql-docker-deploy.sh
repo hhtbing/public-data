@@ -1533,7 +1533,8 @@ validate_nginx_deployment_prerequisites() {
         log_error "未找到域名 ${domain} 的 Nginx 站点配置，部署已停止"
         return 1
     fi
-    if validate_nginx_firmware_layout "$conf"; then
+    # 先静默判断宝塔布局；普通 Nginx 的兼容布局会由后备校验处理。
+    if validate_nginx_firmware_layout "$conf" >/dev/null 2>&1; then
         _DEPLOY_NGINX_CONF_MODE="managed"
     elif validate_existing_nginx_firmware_proxy_config "$conf"; then
         _DEPLOY_NGINX_CONF_MODE="compatible"
