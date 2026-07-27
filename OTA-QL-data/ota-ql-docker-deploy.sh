@@ -553,13 +553,16 @@ show_password_info() {
 }
 
 cleanup_old_images() {
-    log_info "清理悬空镜像..."
-    local DANGLING=$(docker images -f "dangling=true" -q)
+    log_info "清理 OTA-QL 悬空镜像..."
+    local DANGLING=$(docker image ls \
+        --filter "dangling=true" \
+        --filter "label=org.opencontainers.image.source=https://github.com/hhtbing/ota" \
+        -q)
     if [ -n "$DANGLING" ]; then
         docker rmi $DANGLING 2>/dev/null || true
-        log_success "悬空镜像已清理"
+        log_success "OTA-QL 悬空镜像已清理"
     else
-        log_info "无需清理"
+        log_info "无需清理 OTA-QL 悬空镜像"
     fi
 }
 
