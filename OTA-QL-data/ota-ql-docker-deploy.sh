@@ -641,22 +641,9 @@ auto_configure_nginx_range() {
         return 0
     fi
 
-    # 搜索 Nginx 配置文件
+    # 与部署前置校验共用解析逻辑，支持非 .conf 的 sites-available 文件名。
     local NGINX_CONF=""
-    local SEARCH_PATHS=(
-        "/www/server/panel/vhost/nginx/${FW_DOMAIN}.conf"
-        "/etc/nginx/conf.d/${FW_DOMAIN}.conf"
-        "/etc/nginx/sites-available/${FW_DOMAIN}"
-        "/etc/nginx/sites-enabled/${FW_DOMAIN}"
-        "/opt/1panel/core/apps/openresty/openresty/conf.d/${FW_DOMAIN}.conf"
-    )
-
-    for path in "${SEARCH_PATHS[@]}"; do
-        if [ -f "$path" ]; then
-            NGINX_CONF="$path"
-            break
-        fi
-    done
+    NGINX_CONF=$(resolve_nginx_conf_for_domain "$FW_DOMAIN" || true)
 
     if [ -z "$NGINX_CONF" ]; then
         log_info "未检测到 Nginx 配置文件，跳过 Range 头自动配置"
@@ -1648,7 +1635,7 @@ resolve_nginx_conf_interactive() {
         [ -d "$dir" ] || continue
         while IFS= read -r f; do
             FOUND_FILES+=("$f")
-        done < <(find "$dir" -maxdepth 1 -name "*.conf" -type f 2>/dev/null | sort)
+        done < <(find "$dir" -maxdepth 1 -type f 2>/dev/null | sort)
     done
 
     if [ ${#FOUND_FILES[@]} -gt 0 ]; then
@@ -4702,6 +4689,8 @@ deploy_container() {
 
     local RP_MODE=$(get_reverse_proxy_mode)
     if [ "$mode" = "production" ] && [ "$RP_MODE" = "yes" ]; then
+        # 缺少 Range 头时在停止旧容器前提示并完成安全注入。
+        auto_configure_nginx_range
         if ! validate_nginx_deployment_prerequisites; then
             log_error "Nginx 固件反代前置校验失败，未停止现有容器"
             return 1
