@@ -99,6 +99,15 @@ log_warning()  { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error()    { echo -e "${RED}[ERROR]${NC} $1"; }
 log_highlight(){ echo -e "${CYAN}$1${NC}"; }
 
+# 部署门禁：成功结果也必须可见，并由操作者按回车确认后才进入下一步。
+# 失败路径由调用方 return 1，不允许通过此确认绕过检查。
+deployment_checkpoint() {
+    local label="$1"
+    echo ""
+    log_success "检查通过: ${label}"
+    read -r -p "按回车确认，继续下一步..." _
+}
+
 # ============================================================================
 # 基础检查函数
 # ============================================================================
@@ -219,8 +228,8 @@ pull_latest_image() {
 check_port_conflicts() {
     local SELF_CONFLICT=false
     local EXT_CONFLICT=false
-    local PORTS=("${HTTPS_PORT}" "${HTTP_FW_PORT}" "${GW_PORT}" "${MQTT_PORT}" "${MQTTS_PORT}")
-    local NAMES=("HTTPS统一" "HTTP固件" "cmux网关" "MQTT" "MQTTS")
+    local PORTS=("${HTTPS_PORT}" "${HTTP_FW_PORT}" "${GW_PORT}" "${MQTT_PORT}" "${MQTTS_PORT}" "${LEGACY_PORT}")
+    local NAMES=("HTTPS统一" "HTTP固件" "cmux网关" "MQTT" "MQTTS" "旧设备兼容")
 
     log_info "检查端口占用..."
     for i in "${!PORTS[@]}"; do
@@ -279,7 +288,7 @@ check_port_conflicts() {
         echo ""
         echo "解决方案:"
         echo "  1. 停止占用端口的服务: sudo systemctl stop <服务名>"
-        echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '10088|10089|10086|31883|38883'"
+        echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '10088|10089|10086|31883|38883|1060'"
         echo "  3. 或修改本脚本中的端口变量后重试"
         echo ""
         read -ep "是否强制继续部署？(可能失败) [y/N]: " FORCE
@@ -4644,6 +4653,7 @@ deploy_container() {
     fi
 
     create_data_directories
+    deployment_checkpoint "数据目录已检查并就绪"
 
     # 交互式设置MQTT服务器地址
     prompt_mqtt_addr
@@ -4678,12 +4688,14 @@ deploy_container() {
     if ! check_port_conflicts; then
         return 1
     fi
+    deployment_checkpoint "端口占用检查通过（包含 10088、10089、10086、31883、38883、1060）"
 
     if [ "$mode" = "production" ] && [ "$RP_MODE" = "yes" ]; then
         if ! validate_nginx_deployment_prerequisites; then
             log_error "Nginx 固件反代前置校验失败，未停止现有容器"
             return 1
         fi
+        deployment_checkpoint "当前固件域名的 Nginx 布局与 /firmware 反代前置校验通过"
     fi
 
     backup_current_image
@@ -4692,16 +4704,23 @@ deploy_container() {
     if ! pull_latest_image; then
         return 1
     fi
+    deployment_checkpoint "最新 Docker 镜像已拉取"
 
-    start_new_container "$mode"
+    if ! start_new_container "$mode"; then
+        log_error "新容器启动检查失败，部署停止"
+        return 1
+    fi
+    deployment_checkpoint "新容器已启动"
     save_deploy_mode "$mode"
 
     if health_check; then
+        deployment_checkpoint "容器健康检查通过（HTTPS API 与设备网关）"
         if [ "$mode" = "production" ] && [ "$RP_MODE" = "yes" ]; then
             if ! apply_and_verify_nginx_firmware_config; then
                 log_error "Nginx 固件反代复位或验证失败，本次部署不标记为成功"
                 return 1
             fi
+            deployment_checkpoint "Nginx /firmware 与 HTTP/HTTPS Range 行为验证通过"
         fi
 
         ensure_cert_sync_cron
