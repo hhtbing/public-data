@@ -1175,6 +1175,32 @@ validate_nginx_firmware_layout() {
     return 0
 }
 
+validate_existing_nginx_firmware_proxy_config() {
+    local file="$1"
+    local firmware_blocks proxy_target range_header if_range_header buffering_off cache_off redirect_rule
+
+    [ -f "$file" ] || {
+        log_error "Nginx 配置文件不存在: $file"
+        return 1
+    }
+
+    firmware_blocks=$(grep -F -c 'location ^~ /firmware {' "$file" 2>/dev/null || true)
+    proxy_target=$(grep -F -c 'proxy_pass http://127.0.0.1:10089/firmware;' "$file" 2>/dev/null || true)
+    range_header=$(grep -F -c 'proxy_set_header Range $http_range;' "$file" 2>/dev/null || true)
+    if_range_header=$(grep -F -c 'proxy_set_header If-Range $http_if_range;' "$file" 2>/dev/null || true)
+    buffering_off=$(grep -F -c 'proxy_buffering off;' "$file" 2>/dev/null || true)
+    cache_off=$(grep -F -c 'proxy_cache off;' "$file" 2>/dev/null || true)
+    redirect_rule=$(grep -E -c '^[[:space:]]*return[[:space:]]+30[1278][[:space:]]+https://\$host\$request_uri;' "$file" 2>/dev/null || true)
+
+    if [ "$firmware_blocks" -lt 1 ] || [ "$proxy_target" -lt 1 ] || [ "$range_header" -lt 1 ] || \
+        [ "$if_range_header" -lt 1 ] || [ "$buffering_off" -lt 1 ] || [ "$cache_off" -lt 1 ] || \
+        [ "$redirect_rule" -lt 1 ]; then
+        log_error "现有 Nginx 配置不兼容: 缺少 /firmware 反代、Range 头透传、关闭缓冲缓存或 HTTP->HTTPS 跳转"
+        return 1
+    fi
+    return 0
+}
+
 validate_normalized_nginx_firmware_config() {
     local file="$1"
     validate_nginx_firmware_layout "$file" || return 1
@@ -1507,15 +1533,23 @@ validate_nginx_deployment_prerequisites() {
         log_error "未找到域名 ${domain} 的 Nginx 站点配置，部署已停止"
         return 1
     fi
-    validate_nginx_firmware_layout "$conf" || return 1
+    if validate_nginx_firmware_layout "$conf"; then
+        _DEPLOY_NGINX_CONF_MODE="managed"
+    elif validate_existing_nginx_firmware_proxy_config "$conf"; then
+        _DEPLOY_NGINX_CONF_MODE="compatible"
+        log_success "检测到现有 Nginx /firmware 反代与 Range 头已就绪，将跳过托管注入"
+    else
+        return 1
+    fi
     _DEPLOY_NGINX_CONF_PATH="$conf"
     log_success "已确认 Nginx 站点配置: $conf"
 }
 
 apply_and_verify_nginx_firmware_config() {
-    local domain conf backup
+    local domain conf backup mode
     domain=$(get_firmware_domain)
     conf="$_DEPLOY_NGINX_CONF_PATH"
+    mode="${_DEPLOY_NGINX_CONF_MODE:-managed}"
     if [ -z "$conf" ]; then
         conf=$(resolve_nginx_conf_for_domain "$domain" || true)
     fi
@@ -1523,6 +1557,13 @@ apply_and_verify_nginx_firmware_config() {
         log_error "无法解析固件域名对应的 Nginx 配置"
         return 1
     }
+
+    if [ "$mode" = "compatible" ]; then
+        log_info "检测到兼容的现有 Nginx 配置，跳过 /firmware 托管注入"
+        verify_nginx_firmware_behavior "$domain" || return 1
+        log_success "HTTP/HTTPS /firmware Range 行为验证全部通过"
+        return 0
+    fi
 
     apply_nginx_firmware_config "$conf" || return 1
     backup="$LAST_NGINX_BACKUP_PATH"
