@@ -31,7 +31,7 @@
 OTA-QL 是清澜雷达（ESP32-S3）固件 OTA 远程升级管理服务，支持：
 
 - 🔌 **cmux 设备网关** — 端口 10086（TCP+TLS 自动识别，设备直连）
-- 📡 **MQTT 3.1.1 Broker** — 端口 1883（明文）/ 8883（TLS）
+- 📡 **MQTT 3.1.1 Broker** — 端口 31883（明文）/ 38883（TLS）
 - 🖥️ **HTTPS 统一服务** — Web 管理面板 + API（端口 10088）
 - 📦 **HTTP 固件服务** — ESP32 OTA 明文固件下载（端口 10089）
 
@@ -42,8 +42,8 @@ OTA-QL 是清澜雷达（ESP32-S3）固件 OTA 远程升级管理服务，支持
 | HTTPS 统一 | 10088 | HTTPS | 127.0.0.1 | Web 管理 + API（Nginx反代） |
 | HTTP 固件 | 10089 | HTTP | 127.0.0.1 | ESP32 OTA 固件下载（v8.9: Nginx /firmware 反代） |
 | cmux 网关 | 10086 | TCP/TLS | 0.0.0.0 | 设备连接（自动识别协议） |
-| MQTT | 1883 | MQTT | 0.0.0.0 | 消息通信（明文） |
-| MQTTS | 8883 | MQTTS | 0.0.0.0 | 消息通信（TLS 加密） |
+| MQTT | 31883 | MQTT | 0.0.0.0 | 消息通信（明文） |
+| MQTTS | 38883 | MQTTS | 0.0.0.0 | 消息通信（TLS 加密） |
 | 遗留兼容 | 1060 | TCP/TLS | 0.0.0.0 | v16.3: 旧固件端口兼容（`legacy_ports` 配置，可选） |
 
 > ⚠️ **防火墙/安全组必须开放的端口**（部署前必须确认）：
@@ -53,8 +53,8 @@ OTA-QL 是清澜雷达（ESP32-S3）固件 OTA 远程升级管理服务，支持
 > | **443** | 入站 TCP | ✅ 必须 | Nginx HTTPS（Web管理+API+固件下载） |
 > | **80** | 入站 TCP | ✅ 必须 | Nginx HTTP→HTTPS 重定向 / Let's Encrypt 验证 |
 > | **10086** | 入站 TCP | ✅ 必须 | cmux 设备接入网关（ESP32设备直连） |
-> | **1883** | 入站 TCP | ✅ 必须 | MQTT Broker 明文（设备通信） |
-> | **8883** | 入站 TCP | ✅ 必须 | MQTTS Broker TLS（设备加密通信） |
+> | **31883** | 入站 TCP | ✅ 必须 | MQTT Broker 明文（设备通信） |
+> | **38883** | 入站 TCP | ✅ 必须 | MQTTS Broker TLS（设备加密通信） |
 > | **1060** | 入站 TCP | ⚠️ 可选 | 遗留端口兼容（旧固件工厂默认端口，v16.3+） |
 > | **22** | 入站 TCP | ✅ 必须 | SSH 运维管理 |
 >
@@ -78,7 +78,7 @@ ghcr.io/hhtbing/ota-ql:latest
 | Docker | 20.10+ |
 | 内存 | ≥ 512MB |
 | 磁盘 | ≥ 1GB 可用空间 |
-| 网络 | 需要开放 443/10086/1883/8883 端口（10088/10089 仅本地） |
+| 网络 | 需要开放 443/10086/31883/38883 端口（10088/10089 仅本地） |
 
 ### 2.2 一键部署（推荐）
 
@@ -246,7 +246,7 @@ MQTT服务器地址 + MQTT Broker 地址 + 固件下载地址 + 存储位置 + �
 ### 5.1 什么是MQTT服务器地址？
 
 设备通过网关(:10086)连接服务器认证后，服务器返回此地址告诉设备 **MQTT Broker 连接到哪里**：
-- **MQTT Broker 地址**: `<MQTT服务器地址>:8883`（MQTTS TLS）或 `<MQTT服务器地址>:1883`（MQTT 明文）
+- **MQTT Broker 地址**: `<MQTT服务器地址>:38883`（MQTTS TLS）或 `<MQTT服务器地址>:31883`（MQTT 明文）
 
 简单理解：**设备认证后"回拨"到这个地址连接 MQTT**。
 
@@ -260,7 +260,7 @@ MQTT服务器地址 + MQTT Broker 地址 + 固件下载地址 + 存储位置 + �
 | 配置方式 | 蓝牙配置（EspBlufi App） | 部署脚本菜单10 | 部署脚本菜单14 |
 | 使用时机 | 设备上电，发起认证 | 认证后，返回MQTT地址 | OTA推送时，返回固件URL |
 | 修改方式 | 逐台设备蓝牙 | 服务器一处修改 | 服务器一处修改 |
-| 涉及端口 | :10086 | :8883 / :1883 | :443(Nginx) / :10089(直连) |
+| 涉及端口 | :10086 | :38883 / :31883 | :443(Nginx) / :10089(直连) |
 | 环境变量 | 无 | `OTA_MQTT_ADDR` | `OTA_FIRMWARE_URL_BASE` |
 
 ### 5.3 设置方式
@@ -277,8 +277,8 @@ MQTT服务器地址 + MQTT Broker 地址 + 固件下载地址 + 存储位置 + �
 什么是MQTT服务器地址？
   设备通过网关(:10086)连接服务器并认证后，
   服务器会返回此地址告诉设备MQTT Broker连接到哪里：
-    MQTT Broker地址 = 此地址:8883 (MQTTS/TLS)
-                   = 此地址:1883 (MQTT明文)
+    MQTT Broker地址 = 此地址:38883 (MQTTS/TLS)
+                   = 此地址:31883 (MQTT明文)
 
   注意: 固件下载地址由菜单[14]的固件下载域名单独控制
 
@@ -303,7 +303,7 @@ MQTT服务器地址 + MQTT Broker 地址 + 固件下载地址 + 存储位置 + �
 ```
 [MQTT服务器地址]
   ✓ MQTT服务器地址:   ota.wisefido.com
-  MQTT地址:    ota.wisefido.com:8883 (MQTTS/TLS)
+  MQTT地址:    ota.wisefido.com:38883 (MQTTS/TLS)
 
 [固件下载域名]
   ✓ 固件域名:   ota.wisefido.com
@@ -370,11 +370,11 @@ OTA-QL 服务有三个对外地址，分别使用**不同来源**的 SSL 证书�
 |---------|------|----------|---------|------|
 | `https://domain:10088` | 10088 | Nginx（宝塔） | Let's Encrypt | Web 管理面板、浏览器访问 |
 | `tls://domain:10086` | 10086 | **OTA-QL Go 服务器** | **需 CA 签发** | ESP32 设备直连认证网关 |
-| `mqtts://domain:8883` | 8883 | **OTA-QL Go 服务器** | **需 CA 签发** | ESP32 MQTT TLS 通信 |
+| `mqtts://domain:38883` | 38883 | **OTA-QL Go 服务器** | **需 CA 签发** | ESP32 MQTT TLS 通信 |
 
 > ⚠️ **为什么 ESP32 需要 CA 签发证书？**
 >
-> ESP32 使用 `esp-x509-crt-bundle`（Mozilla CA 根证书包）验证服务器，**自签名证书会被拒绝**。10086 / 8883 端口由 Go 服务器直接处理 TLS，Nginx 不参与，因此必须为 Go 服务器配置 Let's Encrypt 等 CA 签发的证书。
+> ESP32 使用 `esp-x509-crt-bundle`（Mozilla CA 根证书包）验证服务器，**自签名证书会被拒绝**。10086 / 38883 端口由 Go 服务器直接处理 TLS，Nginx 不参与，因此必须为 Go 服务器配置 Let's Encrypt 等 CA 签发的证书。
 
 ### 6.2 证书路径数据库（17 种）
 
@@ -622,7 +622,7 @@ sudo ./ota-ql-docker-deploy.sh
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
-| 容器无法启动 | 端口被占用 | `netstat -tlnp \| grep -E "10088\|10089\|10086\|1883\|8883"` |
+| 容器无法启动 | 端口被占用 | `netstat -tlnp \| grep -E "10088\|10089\|10086\|31883\|38883"` |
 | 健康检查失败 | 服务未完全启动 | 等待30秒后重试 |
 | 忘记初始密码 | 未记录 | 使用菜单 4 重置密码 |
 | 设备无法连接 | 防火墙未放行 | 检查 iptables/ufw 规则 |
@@ -724,8 +724,8 @@ services:
       - "127.0.0.1:10088:10088"   # Web管理 (Nginx反代)
       - "127.0.0.1:10089:10089"   # 固件下载 (Nginx /firmware 反代)
       - "0.0.0.0:10086:10086"     # 设备网关 (直连)
-      - "0.0.0.0:1883:1883"       # MQTT (直连)
-      - "0.0.0.0:8883:8883"       # MQTTS (直连)
+      - "0.0.0.0:31883:31883"       # MQTT (直连)
+      - "0.0.0.0:38883:38883"       # MQTTS (直连)
     volumes:
       - ./ota-data/firmware:/app/firmware
       - ./ota-data/certs:/app/certs
@@ -744,15 +744,15 @@ services:
 # UFW（Ubuntu）
 sudo ufw allow 443/tcp     # Nginx HTTPS (Web管理+固件下载)
 sudo ufw allow 10086/tcp   # 设备网关 (直连)
-sudo ufw allow 1883/tcp    # MQTT (直连)
-sudo ufw allow 8883/tcp    # MQTTS (直连)
+sudo ufw allow 31883/tcp    # MQTT (直连)
+sudo ufw allow 38883/tcp    # MQTTS (直连)
 # 注意: 10088/10089 不需要开放，已绑定127.0.0.1，通过Nginx反代访问
 
 # firewalld（CentOS）
 sudo firewall-cmd --permanent --add-port=443/tcp
 sudo firewall-cmd --permanent --add-port=10086/tcp
-sudo firewall-cmd --permanent --add-port=1883/tcp
-sudo firewall-cmd --permanent --add-port=8883/tcp
+sudo firewall-cmd --permanent --add-port=31883/tcp
+sudo firewall-cmd --permanent --add-port=38883/tcp
 sudo firewall-cmd --reload
 ```
 
@@ -851,11 +851,11 @@ openssl x509 -in /opt/ota-ql/certs/fullchain.pem -noout -text | grep -A1 "Subjec
 **数据流：**
 
 ```
-设备A（NVS server=ota.wisefido.com）→ :10086 认证 → 回调 ota.wisefido.com:8883
-设备B（NVS server=ota.wisefido.work）→ :10086 认证 → 回调 ota.wisefido.com:8883
+设备A（NVS server=ota.wisefido.com）→ :10086 认证 → 回调 ota.wisefido.com:38883
+设备B（NVS server=ota.wisefido.work）→ :10086 认证 → 回调 ota.wisefido.com:38883
 
 证书SAN: ota.wisefido.com + ota.wisefido.work
-  → ESP32 连 :8883 用 ota.wisefido.com → 匹配SAN → ✅ TLS通过
+  → ESP32 连 :38883 用 ota.wisefido.com → 匹配SAN → ✅ TLS通过
   → ESP32 连 :10086 用 ota.wisefido.work → 匹配SAN → ✅ TLS通过
 ```
 
@@ -924,7 +924,7 @@ SSL 证书覆盖检查 (v5.3)
 [服务地址覆盖检查]
 
   ① MQTT服务器地址（MQTT Broker）
-      地址: ota.wisefido.com:8883
+      地址: ota.wisefido.com:38883
       状态: ✓ 已覆盖 — 证书SAN包含此域名
 
   ② 设备认证网关（cmux 网关）
@@ -952,8 +952,8 @@ v8.9 起，OTA-QL 采用 **Nginx 反向代理 + Docker 容器** 的生产部署�
 ├── :443    ─── HTTPS ──── Nginx反代 → 127.0.0.1:10088 ── Web管理面板 + REST API
 ├── :443/firmware ── HTTPS ── Nginx反代 → 127.0.0.1:10089 ── HTTP固件下载 (ESP32 OTA)
 ├── :10086  ─── TCP/TLS ── Docker直连 (0.0.0.0) ────────── 设备接入网关 (cmux)
-├── :1883   ─── MQTT ───── Docker直连 (0.0.0.0) ────────── MQTT Broker (明文)
-└── :8883   ─── MQTTS ──── Docker直连 (0.0.0.0) ────────── MQTTS Broker (TLS)
+├── :31883 ─── MQTT ───── Docker直连 (0.0.0.0) ────────── MQTT Broker (明文)
+└── :38883 ─── MQTTS ──── Docker直连 (0.0.0.0) ────────── MQTTS Broker (TLS)
 ```
 
 ### 12.2 端口绑定策略
@@ -963,8 +963,8 @@ v8.9 起，OTA-QL 采用 **Nginx 反向代理 + Docker 容器** 的生产部署�
 | 10088 | 127.0.0.1 | ❌ | Nginx :443 反代 | Web管理面板 + API |
 | 10089 | 127.0.0.1 | ❌ | Nginx :443/firmware 反代 | ESP32 固件下载 |
 | 10086 | 0.0.0.0 | ✅ | 设备直连 | cmux 设备网关 |
-| 1883 | 0.0.0.0 | ✅ | 设备直连 | MQTT Broker |
-| 8883 | 0.0.0.0 | ✅ | 设备直连 | MQTTS Broker |
+| 31883 | 0.0.0.0 | ✅ | 设备直连 | MQTT Broker |
+| 38883 | 0.0.0.0 | ✅ | 设备直连 | MQTTS Broker |
 
 > 💡 **安全优势**：10088/10089 不暴露到公网，防火墙无需开放这两个端口。
 
@@ -1128,8 +1128,8 @@ v8.9 之后:  https://ota.wisefido.com/firmware/xxx.bin        (HTTPS Nginx反�
 | 4 | 10088 不可公网访问 | `curl -sk https://<公网IP>:10088/` | 连接拒绝 |
 | 5 | 10089 不可公网访问 | `curl http://<公网IP>:10089/` | 连接拒绝 |
 | 6 | cmux 网关直连 | `telnet ota.wisefido.com 10086` | 连接成功 |
-| 7 | MQTT 直连 | `telnet ota.wisefido.com 1883` | 连接成功 |
-| 8 | MQTTS 直连 | `telnet ota.wisefido.com 8883` | 连接成功 |
+| 7 | MQTT 直连 | `telnet ota.wisefido.com 31883` | 连接成功 |
+| 8 | MQTTS 直连 | `telnet ota.wisefido.com 38883` | 连接成功 |
 | 9 | SSL 证书有效 | `echo | openssl s_client -connect ota.wisefido.com:443 2>/dev/null | openssl x509 -noout -dates` | 证书未过期 |
 | 10 | 固件域名已配置 | 脚本菜单 3 查看部署信息 | 显示固件域名和URL |
 
@@ -1139,8 +1139,8 @@ v8.9 之后:  https://ota.wisefido.com/firmware/xxx.bin        (HTTPS Nginx反�
 # 需要开放的端口（v8.9）
 443/tcp      # Nginx HTTPS（Web管理 + 固件下载）
 10086/tcp    # 设备接入网关 (cmux, 直连)
-1883/tcp     # MQTT Broker (直连)
-8883/tcp     # MQTTS Broker (直连)
+31883/tcp     # MQTT Broker (直连)
+38883/tcp     # MQTTS Broker (直连)
 80/tcp       # HTTP → HTTPS 重定向（可选）
 
 # 不需要开放的端口（已绑定127.0.0.1）
@@ -1150,7 +1150,7 @@ v8.9 之后:  https://ota.wisefido.com/firmware/xxx.bin        (HTTPS Nginx反�
 
 ### 12.7 常见问题
 
-#### Q: 为什么 10086/1883/8883 不能用 Nginx 反代？
+#### Q: 为什么 10086/31883/38883 不能用 Nginx 反代？
 
 这些端口使用**非 HTTP 协议**（TCP/MQTT），Nginx `http` 块无法处理。虽然 Nginx `stream` 块可以做四层透传，但 Docker 直接暴露端口更简单可靠，无需额外配置。
 

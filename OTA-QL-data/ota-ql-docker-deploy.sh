@@ -15,8 +15,8 @@
 #   HTTPS 10088 — Web管理面板 + API + 固件下载（统一HTTPS）
 #   HTTP  10089 — ESP32 OTA明文固件下载
 #   GW    10086 — cmux设备网关（TCP+TLS自动识别）
-#   MQTT   1883 — MQTT Broker（明文）
-#   MQTTS  8883 — MQTT Broker（TLS加密）
+#   MQTT   31883 — MQTT Broker（明文）
+#   MQTTS  38883 — MQTT Broker（TLS加密）
 ###############################################################################
 
 # ============================================================================
@@ -57,8 +57,8 @@ BACKUP_LIST_FILE="${BACKUP_BASE_DIR}/.backup_list"
 HTTPS_PORT="10088"       # Web管理面板 + API + 固件下载（统一HTTPS）
 HTTP_FW_PORT="10089"     # v4.6: ESP32 OTA明文固件下载
 GW_PORT="10086"          # cmux设备网关（TCP+TLS自动识别）
-MQTT_PORT="1883"         # MQTT Broker（明文）
-MQTTS_PORT="8883"        # MQTT Broker（TLS加密）
+MQTT_PORT="31883"         # MQTT Broker（明文）
+MQTTS_PORT="38883"        # MQTT Broker（TLS加密）
 LEGACY_PORT="1060"       # v16.3: 遗留端口兼容（旧固件工厂默认端口）
 
 # 环境变量覆盖（OTA_MQTT_ADDR 优先级最高，兼容旧名OTA_SERVER_ADDR，留空则自动检测本机IP）
@@ -279,7 +279,7 @@ check_port_conflicts() {
         echo ""
         echo "解决方案:"
         echo "  1. 停止占用端口的服务: sudo systemctl stop <服务名>"
-        echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '10088|10089|10086|1883|8883'"
+        echo "  2. 查看占用详情: sudo ss -tlnp | grep -E '10088|10089|10086|31883|38883'"
         echo "  3. 或修改本脚本中的端口变量后重试"
         echo ""
         read -ep "是否强制继续部署？(可能失败) [y/N]: " FORCE
@@ -347,7 +347,7 @@ start_new_container() {
     fi
 
     # v5.0: 自动检测并加载TLS证书（解决ESP32 esp-x509-crt-bundle验证自签名证书失败）
-    # 证书用于: cmux设备网关(10086) + MQTTS(8883) + HTTPS(10088) 的TLS握手
+    # 证书用于: cmux设备网关(10086) + MQTTS(38883) + HTTPS(10088) 的TLS握手
     # 宝塔Nginx的证书只管浏览器访问，设备直连端口需要Go服务器自己的证书
     # 证书由 deploy_container() → deploy_cert_interactive_menu() 交互式配置部署
     local TLS_ENV_ARGS=""
@@ -371,8 +371,8 @@ start_new_container() {
         -p ${HTTPS_BIND}:${HTTPS_PORT}:10088 \
         -p ${HTTP_FW_BIND}:${HTTP_FW_PORT}:10089 \
         -p ${GW_BIND}:${GW_PORT}:10086 \
-        -p ${MQTT_BIND}:${MQTT_PORT}:1883 \
-        -p ${MQTTS_BIND}:${MQTTS_PORT}:8883 \
+        -p ${MQTT_BIND}:${MQTT_PORT}:${MQTT_PORT} \
+        -p ${MQTTS_BIND}:${MQTTS_PORT}:${MQTTS_PORT} \
         -p 0.0.0.0:${LEGACY_PORT}:${LEGACY_PORT} \
         -v ${FIRMWARE_DIR}:/app/firmware \
         -v ${APP_DATA_DIR}:/app/data \
@@ -3242,7 +3242,7 @@ check_cert_coverage() {
 
     # --- 4. 逐项检查 ---
 
-    # 4a. MQTT服务器地址（MQTT Broker地址: cb_addr:8883）
+    # 4a. MQTT服务器地址（MQTT Broker地址: cb_addr:38883）
     print_coverage "① MQTT服务器地址（MQTT Broker）" "$cb_addr" "${MQTTS_PORT}" "Go服务器 (${CERTS_DIR}/)"
 
     # 4b. 设备认证网关（cmux网关: gw_addr:10086）
