@@ -1136,7 +1136,7 @@ resolve_nginx_conf_for_domain() {
                 echo "$candidate"
                 return 0
             fi
-        done < <(find "$dir" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null | sort)
+        done < <(find "$dir" -maxdepth 1 -type f -print 2>/dev/null | sort)
     done
     return 1
 }
