@@ -665,6 +665,7 @@ auto_configure_nginx_range() {
         echo "[Nginx OTA进度]"
         log_success "Nginx Range 头透传已配置 ✓"
         log_info "将保留现有配置，并在部署完成后验证 HTTP/HTTPS Range 行为"
+        read -r -p "  Range 头检查通过，按回车确认并继续..." _
         return 0
     fi
 
@@ -699,6 +700,7 @@ auto_configure_nginx_range() {
     if nginx -t 2>/dev/null && nginx -s reload 2>/dev/null; then
         log_success "Nginx Range 头透传已自动配置并生效 ✓"
         log_info "OTA 进度条将实时追踪 0%→100%"
+        read -r -p "  Range 头配置通过，按回车确认并继续..." _
         return 0
     else
         log_error "Nginx 语法检测或 reload 失败，正在恢复配置"
@@ -2119,6 +2121,7 @@ sync_nginx_certificate_to_ota() {
     deployed_fingerprint=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
     if [ -n "$nginx_fingerprint" ] && [ "$nginx_fingerprint" = "$deployed_fingerprint" ]; then
         log_success "容器 TLS 证书与 Nginx 证书一致 ✓"
+        read -r -p "  TLS 证书检查通过，按回车确认并继续..." _
         return 0
     fi
 
@@ -2131,6 +2134,7 @@ sync_nginx_certificate_to_ota() {
         return 1
     fi
     log_success "容器 TLS 证书已同步为 Nginx 当前证书"
+    read -r -p "  TLS 证书同步通过，按回车确认并继续..." _
 }
 
 # 读取上次成功部署时记录的证书来源。返回值为 0 时设置全局 source_cert/source_key。
