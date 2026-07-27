@@ -641,7 +641,8 @@ prompt_reverse_proxy_mode() {
 auto_configure_nginx_range() {
     local FW_DOMAIN=$(get_firmware_domain)
     if [ -z "$FW_DOMAIN" ]; then
-        return 0
+        log_error "生产反向代理模式未配置固件域名"
+        return 1
     fi
 
     # 与部署前置校验共用解析逻辑，支持非 .conf 的 sites-available 文件名。
@@ -649,15 +650,17 @@ auto_configure_nginx_range() {
     NGINX_CONF=$(resolve_nginx_conf_for_domain "$FW_DOMAIN" || true)
 
     if [ -z "$NGINX_CONF" ]; then
-        log_info "未检测到 Nginx 配置文件，跳过 Range 头自动配置"
-        echo -e "  ${YELLOW}提示: 部署完成后可通过菜单 [15] 手动配置${NC}"
-        return 0
+        log_error "未找到 ${FW_DOMAIN} 对应的 Nginx 配置，无法继续部署"
+        return 1
     fi
 
     log_info "检测到 Nginx 配置: $NGINX_CONF"
 
     # 检查是否已配置 Range 头透传
-    if grep -q "proxy_set_header Range" "$NGINX_CONF"; then
+    if grep -q "proxy_set_header Range" "$NGINX_CONF" && \
+        grep -q "proxy_set_header If-Range" "$NGINX_CONF" && \
+        grep -q "proxy_buffering off" "$NGINX_CONF" && \
+        grep -q "proxy_cache off" "$NGINX_CONF"; then
         echo ""
         echo "[Nginx OTA进度]"
         log_success "Nginx Range 头透传已配置 ✓"
@@ -667,9 +670,8 @@ auto_configure_nginx_range() {
 
     # 检查 /firmware location 是否存在
     if ! grep -q "location.*\/firmware" "$NGINX_CONF"; then
-        log_warning "Nginx 配置中未找到 /firmware location，请先在宝塔面板中配置反向代理"
-        echo -e "  ${YELLOW}提示: 部署完成后可通过菜单 [15] 配置${NC}"
-        return 0
+        log_error "Nginx 配置中未找到 /firmware location，无法继续部署"
+        return 1
     fi
 
     echo ""
@@ -678,27 +680,33 @@ auto_configure_nginx_range() {
     echo ""
     read -ep "  是否自动配置 Nginx Range 头透传? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
-        log_info "跳过 Range 头配置，进度将通过 Safety Net 估算"
-        return 0
+        log_error "未确认 Range 头透传，部署已停止"
+        return 1
     fi
 
     # 备份
     local BACKUP="${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$NGINX_CONF" "$BACKUP"
+    if ! cp "$NGINX_CONF" "$BACKUP"; then
+        log_error "无法备份 Nginx 配置，部署已停止"
+        return 1
+    fi
     log_info "已备份: $BACKUP"
 
     # 插入 Range 头配置
     sed -i '/location.*\/firmware/a\        # OTA-QL Range头透传（实现OTA进度0%→100%实时追踪）\n        proxy_set_header Range $http_range;\n        proxy_set_header If-Range $http_if_range;\n        proxy_buffering off;\n        proxy_cache off;' "$NGINX_CONF"
 
     # 测试语法
-    if nginx -t 2>/dev/null; then
-        nginx -s reload 2>/dev/null
+    if nginx -t 2>/dev/null && nginx -s reload 2>/dev/null; then
         log_success "Nginx Range 头透传已自动配置并生效 ✓"
         log_info "OTA 进度条将实时追踪 0%→100%"
+        return 0
     else
-        log_warning "Nginx 语法检测失败，正在恢复..."
+        log_error "Nginx 语法检测或 reload 失败，正在恢复配置"
         cp "$BACKUP" "$NGINX_CONF"
-        log_info "已恢复原配置，请通过菜单 [15] 手动配置"
+        nginx -t >/dev/null 2>&1 || true
+        nginx -s reload >/dev/null 2>&1 || true
+        log_error "Nginx 配置已恢复，部署已停止"
+        return 1
     fi
 }
 
@@ -2090,15 +2098,21 @@ sync_nginx_certificate_to_ota() {
     local domain conf cert key deployed_fingerprint nginx_fingerprint
 
     domain=$(get_firmware_domain)
-    [ -n "$domain" ] || return 0
+    if [ -z "$domain" ]; then
+        log_error "生产反向代理模式未配置固件域名"
+        return 1
+    fi
     conf=$(resolve_nginx_conf_for_domain "$domain" || true)
-    [ -n "$conf" ] || return 0
+    if [ -z "$conf" ]; then
+        log_error "未找到 ${domain} 对应的 Nginx 站点，无法同步 Go TLS 证书"
+        return 1
+    fi
 
     cert=$(awk '$1 == "ssl_certificate" { gsub(/;/, "", $2); print $2; exit }' "$conf")
     key=$(awk '$1 == "ssl_certificate_key" { gsub(/;/, "", $2); print $2; exit }' "$conf")
     if [ ! -f "$cert" ] || [ ! -f "$key" ]; then
-        log_warning "未从 Nginx 站点解析到可用的 TLS 证书，保留容器当前证书"
-        return 0
+        log_error "Nginx 站点未配置可用的 ssl_certificate/ssl_certificate_key"
+        return 1
     fi
 
     nginx_fingerprint=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
@@ -2111,6 +2125,11 @@ sync_nginx_certificate_to_ota() {
     echo ""
     log_warning "检测到容器 TLS 证书与 Nginx 站点证书不一致，正在同步"
     deploy_cert_to_ota "$cert" "$key" "Nginx站点 ${domain}" || return 1
+    deployed_fingerprint=$(openssl x509 -in "${CERTS_DIR}/fullchain.pem" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+    if [ -z "$nginx_fingerprint" ] || [ "$nginx_fingerprint" != "$deployed_fingerprint" ]; then
+        log_error "证书同步后指纹仍不一致，部署已停止"
+        return 1
+    fi
     log_success "容器 TLS 证书已同步为 Nginx 当前证书"
 }
 
@@ -4639,8 +4658,14 @@ deploy_container() {
     local RP_MODE=$(get_reverse_proxy_mode)
     if [ "$mode" = "production" ] && [ "$RP_MODE" = "yes" ]; then
         # 在 SSL 菜单前明确显示 OTA 进度状态，并同步 Nginx 的当前证书。
-        auto_configure_nginx_range
-        sync_nginx_certificate_to_ota || return 1
+        if ! auto_configure_nginx_range; then
+            log_error "Nginx Range 前置检查未通过，未停止现有容器"
+            return 1
+        fi
+        if ! sync_nginx_certificate_to_ota; then
+            log_error "Go TLS 证书前置检查未通过，未停止现有容器"
+            return 1
+        fi
     fi
 
     # v5.3: SSL证书配置（交互式菜单，含覆盖检查+SAN/通配符申请）
