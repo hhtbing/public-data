@@ -659,8 +659,12 @@ auto_configure_nginx_range() {
     NGINX_CONF=$(resolve_nginx_conf_for_domain "$FW_DOMAIN" || true)
 
     if [ -z "$NGINX_CONF" ]; then
-        log_error "未找到 ${FW_DOMAIN} 对应的 Nginx 配置，无法继续部署"
-        return 1
+        bootstrap_nginx_site_for_domain "$FW_DOMAIN" || return 1
+        NGINX_CONF=$(resolve_nginx_conf_for_domain "$FW_DOMAIN" || true)
+        [ -n "$NGINX_CONF" ] || {
+            log_error "创建后仍无法解析 ${FW_DOMAIN} 的 Nginx 配置"
+            return 1
+        }
     fi
 
     log_info "检测到 Nginx 配置: $NGINX_CONF"
@@ -1095,6 +1099,7 @@ menu_firmware_domain() {
 _NGINX_CONF_PATH=""
 _DEPLOY_NGINX_CONF_PATH=""
 LAST_NGINX_BACKUP_PATH=""
+NEW_NGINX_SITE_CREATED="false"
 
 count_fixed_line() {
     local pattern="$1"
@@ -1159,6 +1164,185 @@ resolve_nginx_conf_for_domain() {
         done < <(find "$dir" -maxdepth 1 -type f -print 2>/dev/null | sort)
     done
     return 1
+}
+
+select_nginx_vhost_dir() {
+    local dir
+    local candidates=(
+        "${NGINX_VHOST_DIR:-/www/server/panel/vhost/nginx}"
+        "/etc/nginx/conf.d"
+        "/etc/nginx/sites-available"
+        "/opt/1panel/core/apps/openresty/openresty/conf.d"
+    )
+    for dir in "${candidates[@]}"; do
+        if [ -d "$dir" ] && [ -w "$dir" ]; then
+            echo "$dir"
+            return 0
+        fi
+    done
+    return 1
+}
+
+write_new_nginx_site_config() {
+    local output="$1"
+    local domain="$2"
+    local cert="$3"
+    local key="$4"
+    local acme_root="$5"
+
+    cat >"$output" <<EOF
+server {
+    listen 80;
+    listen 443 ssl;
+    server_name ${domain};
+
+    ssl_certificate ${cert};
+    ssl_certificate_key ${key};
+
+    #HTTP_TO_HTTPS_START
+    set \$isRedcert 1;
+    if (\$server_port != 443) {
+        set \$isRedcert 2;
+    }
+    if ( \$uri ~ ^/\.well-known/acme-challenge/ ) {
+        set \$isRedcert 1;
+    }
+    # OTA-QL-FIRMWARE-HTTP-START
+    if ( \$uri ~ ^/firmware(/|\$) ) {
+        set \$isRedcert 1;
+    }
+    # OTA-QL-FIRMWARE-HTTP-END
+    if (\$isRedcert != 1) {
+        return 301 https://\$host\$request_uri;
+    }
+    #HTTP_TO_HTTPS_END
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${acme_root};
+    }
+
+    # OTA-QL-FIRMWARE-PROXY-START
+    location ^~ /firmware {
+        proxy_pass http://127.0.0.1:10089/firmware;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Range \$http_range;
+        proxy_set_header If-Range \$http_if_range;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 600s;
+        proxy_read_timeout 600s;
+    }
+    # OTA-QL-FIRMWARE-PROXY-END
+
+    location / {
+        proxy_pass https://127.0.0.1:10088;
+        proxy_ssl_verify off;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+    #PROXY-CONF-END
+}
+EOF
+}
+
+bootstrap_nginx_site_for_domain() {
+    local domain="$1"
+    local nginx_bin="${NGINX_BIN:-nginx}"
+    local vhost_dir conf acme_root bootstrap_conf bootstrap_backup cert key hook
+
+    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || {
+        log_error "域名格式无效，拒绝创建 Nginx 站点: $domain"
+        return 1
+    }
+    vhost_dir=$(select_nginx_vhost_dir || true)
+    [ -n "$vhost_dir" ] || {
+        log_error "未找到可写的 Nginx 站点目录"
+        return 1
+    }
+    conf="${vhost_dir}/${domain}.conf"
+    [ ! -e "$conf" ] || {
+        log_error "目标配置已存在但未声明当前域名，拒绝覆盖: $conf"
+        return 1
+    }
+
+    echo ""
+    log_warning "当前是新域名，尚未建立 Nginx 站点: ${domain}"
+    log_info "将创建专属配置: ${conf}"
+    log_info "证书方式: Let's Encrypt HTTP-01 文件验证（端口 80），并配置自动续期"
+    read -ep "是否自动创建站点并签发证书? [Y/n]: " confirm
+    [[ ! "$confirm" =~ ^[Nn]$ ]] || { log_error "未创建 Nginx 站点，部署停止"; return 1; }
+
+    command -v certbot >/dev/null 2>&1 || {
+        log_info "正在安装 certbot"
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y certbot
+        elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y certbot
+        else
+            log_error "无法自动安装 certbot"
+            return 1
+        fi
+    }
+
+    acme_root="/var/www/ota-ql-acme"
+    sudo mkdir -p "${acme_root}/.well-known/acme-challenge"
+    bootstrap_conf=$(mktemp) || return 1
+    cat >"$bootstrap_conf" <<EOF
+server {
+    listen 80;
+    server_name ${domain};
+    location ^~ /.well-known/acme-challenge/ { root ${acme_root}; }
+    location / { return 503; }
+}
+EOF
+    sudo cp "$bootstrap_conf" "$conf" && rm -f "$bootstrap_conf"
+    if ! sudo "$nginx_bin" -t || ! sudo "$nginx_bin" -s reload; then
+        sudo rm -f "$conf"
+        log_error "Nginx 临时站点验证失败，已删除新建配置"
+        return 1
+    fi
+    if ! sudo certbot certonly --webroot -w "$acme_root" -d "$domain"; then
+        sudo rm -f "$conf"
+        sudo "$nginx_bin" -s reload >/dev/null 2>&1 || true
+        log_error "HTTP 文件验证签发证书失败，已删除临时站点"
+        return 1
+    fi
+
+    cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    key="/etc/letsencrypt/live/${domain}/privkey.pem"
+    [ -f "$cert" ] && [ -f "$key" ] || { log_error "签发成功但证书文件不存在"; return 1; }
+    bootstrap_backup="${conf}.ota-ql.bootstrap"
+    sudo cp -p "$conf" "$bootstrap_backup" || { log_error "无法备份临时验证站点"; return 1; }
+    bootstrap_conf=$(mktemp) || return 1
+    write_new_nginx_site_config "$bootstrap_conf" "$domain" "$cert" "$key" "$acme_root"
+    if ! sudo cp "$bootstrap_conf" "$conf"; then
+        rm -f "$bootstrap_conf"
+        log_error "无法写入正式 Nginx 站点配置"
+        return 1
+    fi
+    rm -f "$bootstrap_conf"
+    if ! sudo "$nginx_bin" -t || ! sudo "$nginx_bin" -s reload; then
+        sudo cp -p "$bootstrap_backup" "$conf"
+        sudo "$nginx_bin" -t >/dev/null 2>&1 && sudo "$nginx_bin" -s reload >/dev/null 2>&1 || true
+        log_error "正式 Nginx 站点验证失败，已恢复临时文件验证站点"
+        return 1
+    fi
+    sudo rm -f "$bootstrap_backup"
+
+    hook="/etc/letsencrypt/renewal-hooks/deploy/ota-ql-${domain}.sh"
+    sudo mkdir -p "$(dirname "$hook")"
+    printf '#!/bin/sh\n%s -t && %s -s reload\n' "$nginx_bin" "$nginx_bin" | sudo tee "$hook" >/dev/null
+    sudo chmod 755 "$hook"
+    NEW_NGINX_SITE_CREATED="true"
+    _DEPLOY_NGINX_CONF_PATH="$conf"
+    log_success "新域名 Nginx 站点、文件验证证书和自动续期钩子已建立"
+    deployment_checkpoint "${domain} 的 Nginx 站点与 Let's Encrypt 文件验证证书已就绪"
 }
 
 validate_nginx_firmware_layout() {
@@ -4683,7 +4867,12 @@ deploy_container() {
     fi
 
     # v5.3: SSL证书配置（交互式菜单，含覆盖检查+SAN/通配符申请）
-    deploy_cert_interactive_menu
+    if [ "$NEW_NGINX_SITE_CREATED" = "true" ]; then
+        log_success "新站点证书已签发并同步，跳过重复的证书选择菜单"
+        deployment_checkpoint "当前域名证书覆盖与 OTA Go TLS 证书同步完成"
+    else
+        deploy_cert_interactive_menu
+    fi
 
     if ! check_port_conflicts; then
         return 1
