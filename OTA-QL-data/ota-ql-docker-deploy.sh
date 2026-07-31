@@ -643,7 +643,25 @@ prompt_reverse_proxy_mode() {
 
     save_reverse_proxy_mode "yes"
     log_info "已选择: 使用反向代理 (HTTP固件端口绑定 127.0.0.1)"
-    log_info "菜单 1 将自动复位并验证 HTTP 例外、/firmware 反代及 Range 透传"
+    echo ""
+    echo -e "${BOLD}基础反向代理目标（Web 管理/API）:${NC}"
+    echo -e "  协议: ${CYAN}HTTPS${NC}"
+    echo -e "  IP:   ${CYAN}127.0.0.1${NC}"
+    echo -e "  端口: ${CYAN}${HTTPS_PORT}${NC}"
+    echo -e "  URL:  ${CYAN}https://127.0.0.1:${HTTPS_PORT}${NC}"
+    echo ""
+    echo "  1. 由脚本自动检测并配置（推荐）"
+    echo "  2. 我在宝塔/面板中手动建立基础反向代理"
+    echo ""
+    read -ep "请选择基础反向代理配置方式 [1-2] (默认1): " setup_choice
+    if [ "$setup_choice" = "2" ]; then
+        REVERSE_PROXY_SETUP_MODE="manual"
+        log_info "已选择: 手动建立基础反向代理，脚本将等待并复检"
+    else
+        REVERSE_PROXY_SETUP_MODE="auto"
+        log_info "已选择: 脚本自动配置反向代理"
+    fi
+    log_info "/firmware、HTTP 例外和 Range 透传均由脚本自动配置和验证"
 }
 
 # 自动检测并配置 Nginx Range 头透传
@@ -659,7 +677,11 @@ auto_configure_nginx_range() {
     NGINX_CONF=$(resolve_nginx_conf_for_domain "$FW_DOMAIN" || true)
 
     if [ -z "$NGINX_CONF" ]; then
-        bootstrap_nginx_site_for_domain "$FW_DOMAIN" || return 1
+        if [ "${REVERSE_PROXY_SETUP_MODE:-auto}" = "manual" ]; then
+            wait_for_manual_nginx_site "$FW_DOMAIN" || return 1
+        else
+            bootstrap_nginx_site_for_domain "$FW_DOMAIN" || return 1
+        fi
         NGINX_CONF=$(resolve_nginx_conf_for_domain "$FW_DOMAIN" || true)
         [ -n "$NGINX_CONF" ] || {
             log_error "创建后仍无法解析 ${FW_DOMAIN} 的 Nginx 配置"
@@ -682,47 +704,19 @@ auto_configure_nginx_range() {
         return 0
     fi
 
-    # 检查 /firmware location 是否存在
-    if ! grep -q "location.*\/firmware" "$NGINX_CONF"; then
-        log_error "Nginx 配置中未找到 /firmware location，无法继续部署"
-        return 1
-    fi
-
     echo ""
-    echo -e "  ${CYAN}检测到 Nginx /firmware 反代尚未配置 Range 头透传${NC}"
-    echo "  配置 Range 头透传可实现 OTA 进度 0%→100% 实时追踪"
+    echo -e "  ${CYAN}检测到基础反向代理已存在，但 OTA 固件规则尚未完整配置${NC}"
+    echo "  脚本将自动配置 /firmware、HTTP 例外和 Range 头透传"
+    echo "  部署人员不需要手动填写这些高级规则"
     echo ""
-    read -ep "  是否自动配置 Nginx Range 头透传? [Y/n]: " confirm
+    read -ep "  是否由脚本自动补齐 OTA 固件反向代理规则? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
-        log_error "未确认 Range 头透传，部署已停止"
+        log_error "未确认 OTA 固件反向代理规则，部署已停止"
         return 1
     fi
-
-    # 备份
-    local BACKUP="${NGINX_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-    if ! cp "$NGINX_CONF" "$BACKUP"; then
-        log_error "无法备份 Nginx 配置，部署已停止"
-        return 1
-    fi
-    log_info "已备份: $BACKUP"
-
-    # 插入 Range 头配置
-    sed -i '/location.*\/firmware/a\        # OTA-QL Range头透传（实现OTA进度0%→100%实时追踪）\n        proxy_set_header Range $http_range;\n        proxy_set_header If-Range $http_if_range;\n        proxy_buffering off;\n        proxy_cache off;' "$NGINX_CONF"
-
-    # 测试语法
-    if nginx -t 2>/dev/null && nginx -s reload 2>/dev/null; then
-        log_success "Nginx Range 头透传已自动配置并生效 ✓"
-        log_info "OTA 进度条将实时追踪 0%→100%"
-        read -r -p "  Range 头配置通过，按回车确认并继续..." _
-        return 0
-    else
-        log_error "Nginx 语法检测或 reload 失败，正在恢复配置"
-        cp "$BACKUP" "$NGINX_CONF"
-        nginx -t >/dev/null 2>&1 || true
-        nginx -s reload >/dev/null 2>&1 || true
-        log_error "Nginx 配置已恢复，部署已停止"
-        return 1
-    fi
+    apply_nginx_firmware_config "$NGINX_CONF" || return 1
+    log_success "Nginx /firmware、HTTP 例外和 Range 头已自动配置并生效 ✓"
+    read -r -p "  OTA 固件反向代理规则检查通过，按回车确认并继续..." _
 }
 
 # ============================================================================
@@ -1164,6 +1158,42 @@ resolve_nginx_conf_for_domain() {
         done < <(find "$dir" -maxdepth 1 -type f -print 2>/dev/null | sort)
     done
     return 1
+}
+
+show_manual_reverse_proxy_instructions() {
+    local domain="$1"
+    echo ""
+    echo "========================================="
+    echo "  手动建立基础反向代理"
+    echo "========================================="
+    echo ""
+    echo -e "  站点域名: ${CYAN}${domain}${NC}"
+    echo -e "  目标协议: ${CYAN}HTTPS${NC}"
+    echo -e "  目标 IP:  ${CYAN}127.0.0.1${NC}"
+    echo -e "  目标端口: ${CYAN}${HTTPS_PORT}${NC}"
+    echo -e "  目标 URL:  ${CYAN}https://127.0.0.1:${HTTPS_PORT}${NC}"
+    echo -e "  域名证书: ${CYAN}为 ${domain} 配置有效的 CA 证书${NC}"
+    echo ""
+    echo -e "  ${YELLOW}只需完成以上基础站点和反向代理。${NC}"
+    echo "  不要手动添加 /firmware、10089、Range、HTTP 例外；脚本会自动完成。"
+    echo "  保存面板配置后回到这里按回车，脚本会重新检测。"
+}
+
+wait_for_manual_nginx_site() {
+    local domain="$1"
+    local answer conf
+    show_manual_reverse_proxy_instructions "$domain"
+    while true; do
+        read -r -p "按回车重新检测 Nginx 站点；输入 q 退出部署: " answer
+        [[ ! "$answer" =~ ^[Qq]$ ]] || { log_error "手动反向代理尚未完成，部署停止"; return 1; }
+        conf=$(resolve_nginx_conf_for_domain "$domain" || true)
+        if [ -n "$conf" ]; then
+            log_success "已找到当前域名的 Nginx 站点: $conf"
+            return 0
+        fi
+        log_warning "仍未找到 server_name 精确匹配 ${domain} 的站点"
+        log_info "请确认面板已保存并重载 Nginx，然后再次按回车检测"
+    done
 }
 
 select_nginx_vhost_dir() {
@@ -2305,6 +2335,23 @@ sync_nginx_certificate_to_ota() {
 
     cert=$(awk '$1 == "ssl_certificate" { gsub(/;/, "", $2); print $2; exit }' "$conf")
     key=$(awk '$1 == "ssl_certificate_key" { gsub(/;/, "", $2); print $2; exit }' "$conf")
+    if { [ ! -f "$cert" ] || [ ! -f "$key" ]; } && [ "${REVERSE_PROXY_SETUP_MODE:-auto}" = "manual" ]; then
+        echo ""
+        log_warning "基础反向代理已找到，但 ${domain} 的有效证书尚未配置"
+        log_info "请在面板为当前域名申请或选择有效 CA 证书，保存后回到脚本"
+        while true; do
+            read -r -p "按回车重新检测证书；输入 q 退出部署: " answer
+            [[ ! "$answer" =~ ^[Qq]$ ]] || { log_error "域名证书尚未完成，部署停止"; return 1; }
+            conf=$(resolve_nginx_conf_for_domain "$domain" || true)
+            cert=$(awk '$1 == "ssl_certificate" { gsub(/;/, "", $2); print $2; exit }' "$conf")
+            key=$(awk '$1 == "ssl_certificate_key" { gsub(/;/, "", $2); print $2; exit }' "$conf")
+            if [ -f "$cert" ] && [ -f "$key" ]; then
+                log_success "已检测到当前域名的 Nginx 证书与私钥"
+                break
+            fi
+            log_warning "证书仍未就绪，请在面板保存证书后再次检测"
+        done
+    fi
     if [ ! -f "$cert" ] || [ ! -f "$key" ]; then
         log_error "Nginx 站点未配置可用的 ssl_certificate/ssl_certificate_key"
         return 1
