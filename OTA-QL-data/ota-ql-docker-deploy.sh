@@ -661,7 +661,7 @@ prompt_reverse_proxy_mode() {
         REVERSE_PROXY_SETUP_MODE="auto"
         log_info "已选择: 脚本自动配置反向代理"
     fi
-    log_info "/firmware、HTTP 例外和 Range 透传均由脚本自动配置和验证"
+    log_info "WebSocket、/firmware、HTTP 例外和 Range 透传均由脚本自动配置和验证"
 }
 
 # 自动检测并配置 Nginx Range 头透传
@@ -698,9 +698,11 @@ auto_configure_nginx_range() {
         grep -q "proxy_cache off" "$NGINX_CONF"; then
         echo ""
         echo "[Nginx OTA进度]"
+        apply_nginx_websocket_proxy_config "$NGINX_CONF" || return 1
         log_success "Nginx Range 头透传已配置 ✓"
+        log_success "Nginx WebSocket 已配置，Live Logs/实时监控可通过反向代理连接 ✓"
         log_info "将保留现有配置，并在部署完成后验证 HTTP/HTTPS Range 行为"
-        read -r -p "  Range 头检查通过，按回车确认并继续..." _
+        read -r -p "  Range 与 WebSocket 检查通过，按回车确认并继续..." _
         return 0
     fi
 
@@ -715,8 +717,10 @@ auto_configure_nginx_range() {
         return 1
     fi
     apply_nginx_firmware_config "$NGINX_CONF" || return 1
+    apply_nginx_websocket_proxy_config "$NGINX_CONF" || return 1
     log_success "Nginx /firmware、HTTP 例外和 Range 头已自动配置并生效 ✓"
-    read -r -p "  OTA 固件反向代理规则检查通过，按回车确认并继续..." _
+    log_success "Nginx WebSocket 已自动配置，Live Logs/实时监控可通过反向代理连接 ✓"
+    read -r -p "  OTA 固件与 WebSocket 反向代理检查通过，按回车确认并继续..." _
 }
 
 # ============================================================================
@@ -1175,7 +1179,7 @@ show_manual_reverse_proxy_instructions() {
     echo -e "  域名证书: ${CYAN}为 ${domain} 配置有效的 CA 证书${NC}"
     echo ""
     echo -e "  ${YELLOW}只需完成以上基础站点和反向代理。${NC}"
-    echo "  不要手动添加 /firmware、10089、Range、HTTP 例外；脚本会自动完成。"
+    echo "  不要手动添加 WebSocket、/firmware、10089、Range、HTTP 例外；脚本会自动完成。"
     echo "  保存面板配置后回到这里按回车，脚本会重新检测。"
 }
 
@@ -1271,6 +1275,9 @@ server {
     location / {
         proxy_pass https://127.0.0.1:10088;
         proxy_ssl_verify off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
         proxy_set_header Host \$http_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -1279,6 +1286,100 @@ server {
     #PROXY-CONF-END
 }
 EOF
+}
+
+validate_nginx_websocket_proxy_config() {
+    local file="$1"
+    grep -Eq 'proxy_pass[[:space:]]+https://127\.0\.0\.1:10088;' "$file" || return 1
+    grep -Eq 'proxy_http_version[[:space:]]+1\.1;' "$file" || return 1
+    grep -Fq 'proxy_set_header Upgrade $http_upgrade;' "$file" || return 1
+    grep -Eq 'proxy_set_header[[:space:]]+Connection[[:space:]]+"?upgrade"?;' "$file" || return 1
+}
+
+normalize_nginx_websocket_proxy_config() {
+    local input="$1"
+    local output="$2"
+
+    awk '
+        function brace_delta(text,    opens, closes, tmp) {
+            tmp = text; opens = gsub(/\{/, "", tmp)
+            tmp = text; closes = gsub(/\}/, "", tmp)
+            return opens - closes
+        }
+        function flush_root(    i, indent) {
+            if (root_text ~ /proxy_pass[[:space:]]+https:\/\/127\.0\.0\.1:10088;/) {
+                for (i = 1; i < root_count; i++) {
+                    if (root_lines[i] ~ /^[[:space:]]*proxy_http_version[[:space:]]+/) continue
+                    if (root_lines[i] ~ /^[[:space:]]*proxy_set_header[[:space:]]+Upgrade[[:space:]]+/) continue
+                    if (root_lines[i] ~ /^[[:space:]]*proxy_set_header[[:space:]]+Connection[[:space:]]+/) continue
+                    print root_lines[i]
+                }
+                indent = "        "
+                print indent "proxy_http_version 1.1;"
+                print indent "proxy_set_header Upgrade $http_upgrade;"
+                print indent "proxy_set_header Connection \"upgrade\";"
+                print root_lines[root_count]
+                matched++
+            } else {
+                for (i = 1; i <= root_count; i++) print root_lines[i]
+            }
+            delete root_lines
+            root_text = ""; root_count = 0; in_root = 0; root_depth = 0
+        }
+        {
+            line = $0
+            if (!in_root && line ~ /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/) {
+                in_root = 1; root_depth = brace_delta(line)
+                root_lines[++root_count] = line; root_text = line ORS
+                if (root_depth <= 0) flush_root()
+                next
+            }
+            if (in_root) {
+                root_lines[++root_count] = line; root_text = root_text line ORS
+                root_depth += brace_delta(line)
+                if (root_depth <= 0) flush_root()
+                next
+            }
+            print line
+        }
+        END { if (in_root || matched != 1) exit 2 }
+    ' "$input" >"$output" || {
+        rm -f "$output"
+        log_error "无法定位唯一的 Web 管理反向代理（https://127.0.0.1:10088）"
+        return 1
+    }
+    validate_nginx_websocket_proxy_config "$output" || {
+        rm -f "$output"
+        log_error "生成后的 WebSocket 反向代理配置校验失败"
+        return 1
+    }
+}
+
+apply_nginx_websocket_proxy_config() {
+    local requested_conf="$1"
+    local conf nginx_bin stamp backup temp
+    nginx_bin="${NGINX_BIN:-nginx}"
+    conf=$(readlink -f "$requested_conf" 2>/dev/null || echo "$requested_conf")
+
+    if validate_nginx_websocket_proxy_config "$conf"; then
+        log_success "Nginx WebSocket 反向代理已配置 ✓"
+        return 0
+    fi
+    stamp=$(date +%Y%m%d_%H%M%S)
+    backup="${conf}.ota-ql.websocket.bak.${stamp}"
+    temp=$(mktemp "${conf}.ota-ql.websocket.tmp.XXXXXX") || return 1
+    cp -p "$conf" "$backup" || { rm -f "$temp"; return 1; }
+    normalize_nginx_websocket_proxy_config "$conf" "$temp" || { rm -f "$temp"; return 1; }
+    chmod --reference="$conf" "$temp" 2>/dev/null || true
+    chown --reference="$conf" "$temp" 2>/dev/null || true
+    mv -f "$temp" "$conf" || return 1
+    if ! "$nginx_bin" -t || ! "$nginx_bin" -s reload; then
+        cp -pf "$backup" "$conf"
+        "$nginx_bin" -t >/dev/null 2>&1 && "$nginx_bin" -s reload >/dev/null 2>&1 || true
+        log_error "WebSocket 反向代理配置失败，已恢复备份: $backup"
+        return 1
+    fi
+    log_success "Nginx WebSocket 反向代理已自动配置并生效 ✓"
 }
 
 bootstrap_nginx_site_for_domain() {
@@ -1715,6 +1816,25 @@ verify_http_redirect() {
     log_success "HTTP 根路径仍正常跳转 HTTPS"
 }
 
+verify_websocket_upgrade() {
+    local domain="$1"
+    local headers status
+    headers=$(mktemp) || return 1
+    curl -sS -k --http1.1 --connect-timeout 10 --max-time 3 \
+        --resolve "${domain}:443:127.0.0.1" -D "$headers" -o /dev/null \
+        -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+        -H 'Sec-WebSocket-Version: 13' \
+        -H 'Sec-WebSocket-Key: SGVsbG9XZWJTb2NrZXQxMg==' \
+        "https://${domain}/ws/logs" 2>/dev/null || true
+    status=$(tr -d '\r' <"$headers" | awk '/^HTTP\// { code=$2 } END { print code }')
+    rm -f "$headers"
+    if [ "$status" != "101" ]; then
+        log_error "WebSocket 反向代理验证失败: expected=101 actual=${status:-curl_error}"
+        return 1
+    fi
+    log_success "WebSocket /ws/logs 验证通过 (101 Switching Protocols)"
+}
+
 verify_nginx_firmware_behavior() {
     local domain="$1"
     local probe_file=""
@@ -1749,6 +1869,9 @@ verify_nginx_firmware_behavior() {
     fi
     if [ "$result" -eq 0 ]; then
         verify_range_response "直连 10089" "http://127.0.0.1:${HTTP_FW_PORT}/firmware/${url_path}" || result=1
+    fi
+    if [ "$result" -eq 0 ]; then
+        verify_websocket_upgrade "$domain" || result=1
     fi
 
     [ "$created_probe" != "true" ] || rm -f "$probe_file"
@@ -4931,7 +5054,7 @@ deploy_container() {
             log_error "Nginx 固件反代前置校验失败，未停止现有容器"
             return 1
         fi
-        deployment_checkpoint "当前固件域名的 Nginx 布局与 /firmware 反代前置校验通过"
+        deployment_checkpoint "当前域名的 Nginx、/firmware Range 与 WebSocket 前置校验通过"
     fi
 
     backup_current_image
@@ -4956,7 +5079,7 @@ deploy_container() {
                 log_error "Nginx 固件反代复位或验证失败，本次部署不标记为成功"
                 return 1
             fi
-            deployment_checkpoint "Nginx /firmware 与 HTTP/HTTPS Range 行为验证通过"
+            deployment_checkpoint "Nginx /firmware Range 与 WebSocket 101 行为验证通过"
         fi
 
         ensure_cert_sync_cron
